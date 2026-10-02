@@ -149,10 +149,11 @@ class TPC(BaseModel):
         hidden_dim (int): Hidden dimension for prediction head. Default: 64.
         dropout (float): Dropout probability. Default: 0.1.
         loss_fn (str): Loss function to use ('msle' or 'mse'). Default: 'msle'.
-        min_time (int): Prediction hour from which loss is computed. Default: 5.
+        min_time (int): Warmup time index before evaluation begins (t >= min_time). Default: 4
+            (corresponding to 5 hours elapsed since ICU admission).
         floor_days (float): Minimum threshold floor for LoS (in days, ~30 mins = 1/48). Default: 1/48.
-        sequence_output (bool): If True, returns hourly predictions (B, T, 1). If False,
-            pools over time for a single patient summary prediction (B, 1). Default: True.
+        use_decay (bool): Whether to include exponential decay channels (0.75^j). Set to False
+            for the paper's 'No Decay' ablation variant. Default: True.
         multitask (bool): Whether to predict both LoS and in-hospital mortality. Default: False.
         alpha (float): Weighting for mortality loss in multitask mode. Default: 0.5.
     """
@@ -171,9 +172,8 @@ class TPC(BaseModel):
         hidden_dim: int = 64,
         dropout: float = 0.1,
         loss_fn: str = "msle",
-        min_time: int = 5,
+        min_time: int = 4,
         floor_days: float = 1.0 / 48.0,
-        sequence_output: bool = True,
         use_decay: bool = True,
         multitask: bool = False,
         alpha: float = 0.5,
@@ -192,7 +192,6 @@ class TPC(BaseModel):
         self.loss_fn_type = loss_fn.lower()
         self.min_time = min_time
         self.floor_days = floor_days
-        self.sequence_output = sequence_output
         self.use_decay = use_decay
         self.multitask = multitask
         self.alpha = alpha
@@ -233,7 +232,12 @@ class TPC(BaseModel):
         y_true: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Computes MSLE (Eq. 6) or MSE loss averaged per stay over valid hours (t >= min_time)."""
+        """Computes MSLE (Eq. 6) or MSE loss averaged per stay over valid hours (t >= min_time).
+        
+        Fully vectorized implementation conforming to Equation (6) in Rocheteau et al.:
+        Loss is averaged over valid time steps within each stay first, and then averaged
+        across valid stays in the batch.
+        """
         # Ensure 3D: (B, T, 1)
         if y_true.dim() == 1:
             y_true = y_true.view(-1, 1, 1)
@@ -250,41 +254,33 @@ class TPC(BaseModel):
         else:
             valid_mask = (y_true > 0.0)
             
-        # Enforce evaluation starting at min_time (default: 5 hours, Section 5.1.1)
+        # Enforce evaluation starting at min_time (default: 4, corresponding to 5h elapsed)
         if T > self.min_time:
             warmup_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
             warmup_mask[:, self.min_time:, :] = True
-            combined_mask = valid_mask & warmup_mask
-            for b in range(B):
-                if combined_mask[b].sum() == 0 and valid_mask[b].sum() > 0:
-                    combined_mask[b] = valid_mask[b]
-            eval_mask = combined_mask
+            eval_mask = valid_mask & warmup_mask
+            # If all steps for a stay fall in warmup, fallback to valid_mask so stay is retained
+            no_eval = (eval_mask.sum(dim=(1, 2)) == 0) & (valid_mask.sum(dim=(1, 2)) > 0)
+            eval_mask[no_eval] = valid_mask[no_eval]
         else:
             eval_mask = valid_mask
 
-        # Compute loss per patient (Eq. 6 averages over T per stay first)
-        patient_losses = []
-        for b in range(B):
-            m_b = eval_mask[b].squeeze(-1)
-            if m_b.sum() == 0:
-                continue
-            y_p_b = y_pred[b, m_b]
-            y_t_b = y_true[b, m_b]
-            
-            if self.loss_fn_type == "msle":
-                log_pred = torch.log(torch.clamp(y_p_b, min=self.floor_days))
-                log_true = torch.log(torch.clamp(y_t_b, min=self.floor_days))
-                patient_losses.append(torch.mean((log_pred - log_true) ** 2))
-            else:
-                patient_losses.append(F.mse_loss(y_p_b, y_t_b))
-                
-        if len(patient_losses) > 0:
-            return torch.stack(patient_losses).mean()
-            
-        # Fallback if no valid mask entries
+        # Compute per-step error
         if self.loss_fn_type == "msle":
-            return torch.mean((torch.log(torch.clamp(y_pred, min=self.floor_days)) - torch.log(torch.clamp(y_true, min=self.floor_days))) ** 2)
-        return F.mse_loss(y_pred, y_true)
+            log_pred = torch.log(torch.clamp(y_pred, min=self.floor_days))
+            log_true = torch.log(torch.clamp(y_true, min=self.floor_days))
+            err = (log_pred - log_true) ** 2
+        else:
+            err = (y_pred - y_true) ** 2
+
+        # Average per stay over valid hours (Eq. 6), then average across stays
+        m = eval_mask.float()
+        n = m.sum(dim=(1, 2))  # (B,) valid hours per patient
+        per_stay = (err * m).sum(dim=(1, 2)) / n.clamp(min=1.0)
+        valid_stays = (n > 0)
+        if valid_stays.any():
+            return per_stay[valid_stays].mean()
+        return per_stay.mean()
 
     def forward(
         self,
@@ -368,65 +364,43 @@ class TPC(BaseModel):
         los_out = self.head_fc(feat).transpose(1, 2)  # (B, T, 1)
         
         # Softplus with matching floor prevents dying ReLUs and log singularities
-        y_prob = F.softplus(los_out) + self.floor_days
+        y_prob = F.softplus(los_out) + self.floor_days  # (B, T, 1)
         
         raw_mask = kwargs.get("mask")
         mask_tensor = raw_mask if isinstance(raw_mask, torch.Tensor) else None
         
-        if not self.sequence_output:
-            # Pick the true last valid step of each patient (avoiding zero-padded steps)
-            if mask_tensor is not None:
-                lengths = mask_tensor.sum(dim=1).long()
-                last_indices = torch.clamp(lengths - 1, min=0)
-                y_prob = torch.stack([y_prob[b, last_indices[b], :] for b in range(B)], dim=0)
-            else:
-                y_prob = y_prob[:, -1, :]  # (B, 1)
-            
         result: dict[str, torch.Tensor] = {
             "y_prob": y_prob,
         }
         
-        # 7. Loss Calculation
+        # 6. Loss Calculation
         raw_y_true = kwargs.get(self.label_key)
         if raw_y_true is None:
             raw_y_true = kwargs.get("y_true")
             
         if isinstance(raw_y_true, torch.Tensor):
             y_true_tensor = raw_y_true.float()
+            result["y_true"] = y_true_tensor
+            result["loss"] = self._compute_loss(y_prob, y_true_tensor, mask=mask_tensor)
             
-            # If model is pooled (B, 1) but sequence targets (B, T, 1) were supplied, pool targets similarly
-            if not self.sequence_output and y_true_tensor.dim() >= 2 and y_true_tensor.shape[1] > 1:
-                if mask_tensor is not None:
-                    lengths = mask_tensor.sum(dim=1).long()
-                    last_idx = torch.clamp(lengths - 1, min=0)
-                    y_true_eval = torch.stack([y_true_tensor[b, last_idx[b], :] for b in range(B)], dim=0)
-                else:
-                    y_true_eval = y_true_tensor[:, -1:, :]
-                result["y_true"] = y_true_eval
-                result["loss"] = self._compute_loss(y_prob, y_true_eval)
-            else:
-                result["y_true"] = y_true_tensor
-                result["loss"] = self._compute_loss(y_prob, y_true_tensor, mask=mask_tensor)
-            
-            # Multitask in-hospital mortality loss
+            # Multitask in-hospital mortality loss using numerically stable logits
             if self.multitask and hasattr(self, "mort_fc"):
-                mort_out = self.mort_fc(feat).transpose(1, 2)
-                mort_prob = torch.sigmoid(mort_out)
-                result["mortality_prob"] = mort_prob
+                mort_out = self.mort_fc(feat).transpose(1, 2)  # (B, T, 1) logits
+                result["mortality_prob"] = torch.sigmoid(mort_out)
                 
                 raw_mort = kwargs.get("mortality")
                 if raw_mort is None:
                     raw_mort = kwargs.get("in_hospital_mortality")
                 if isinstance(raw_mort, torch.Tensor):
-                    mort_true = raw_mort.float().view(-1, 1, 1).expand_as(mort_prob)
+                    mort_true = raw_mort.float().view(-1, 1, 1).expand_as(mort_out)
                     if mask_tensor is not None:
                         m_valid = mask_tensor.bool().unsqueeze(-1)
                         if m_valid.sum() > 0:
-                            mort_loss = F.binary_cross_entropy(mort_prob[m_valid], mort_true[m_valid])
+                            mort_loss = F.binary_cross_entropy_with_logits(mort_out[m_valid], mort_true[m_valid])
                         else:
-                            mort_loss = F.binary_cross_entropy(mort_prob, mort_true)
+                            mort_loss = F.binary_cross_entropy_with_logits(mort_out, mort_true)
                     else:
-                        mort_loss = F.binary_cross_entropy(mort_prob, mort_true)
+                        mort_loss = F.binary_cross_entropy_with_logits(mort_out, mort_true)
                     result["loss"] = result["loss"] + self.alpha * mort_loss
         elif self.multitask and hasattr(self, "mort_fc"):
             mort_out = self.mort_fc(feat).transpose(1, 2)

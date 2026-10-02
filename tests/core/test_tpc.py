@@ -1,7 +1,16 @@
+import sys
+from pathlib import Path
 from datetime import datetime, timedelta
 import torch
 import pytest
+
+# Ensure repository root is on sys.path regardless of execution directory
+repo_root = str(Path(__file__).resolve().parents[2])
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
 from pyhealth.models.tpc import TPC
+from pyhealth.datasets import collate_fn_dict_with_padding
 from examples.mimic4_los_tpc import generate_tpc_tensors, LengthOfStayTask
 
 
@@ -100,7 +109,6 @@ def test_tpc_sequence_forward_and_loss(batch_size, seq_len, num_vitals, num_stat
         point_dim=16,
         kernel_size=3,
         loss_fn="msle",
-        sequence_output=True,
     )
     
     # 3. Forward pass
@@ -132,7 +140,6 @@ def test_tpc_causality():
         static_dim=0,
         n_layers=3,
         kernel_size=3,
-        sequence_output=True,
     )
     model.eval()
     
@@ -158,7 +165,7 @@ def test_tpc_causality():
 def test_tpc_padding_invariance():
     """Verifies that zero-padding steps (where mask = 0) do not contaminate loss calculation."""
     num_vitals = 12
-    model = TPC(dataset=None, continuous_dim=num_vitals, sequence_output=True)
+    model = TPC(dataset=None, continuous_dim=num_vitals)
     model.eval()
     
     # Patient 1: real stay of 10 hours
@@ -253,34 +260,47 @@ def test_task_filters_and_target():
     assert len(task(p_nolab)) == 0
 
 
-def test_tpc_pooled_summary():
-    """Tests optional pooled single-patient summary prediction."""
-    batch_size = 3
-    seq_len = 24
+def test_tpc_collate_and_training_padding():
+    """Tests PyHealth collation padding of variable-length stays and training stability."""
     num_vitals = 12
+    T1, T2 = 8, 16
     
-    model = TPC(
-        dataset=None,
-        continuous_dim=num_vitals,
-        static_dim=0,
-        sequence_output=False,
-    )
+    # Patient 1: 8 hours
+    s1 = {
+        "vitals": torch.randn(T1, num_vitals),
+        "vitals_decay": torch.rand(T1, num_vitals),
+        "static": torch.tensor([0.5, 1.0]),
+        "mask": torch.ones(T1, dtype=torch.bool),
+        "los": torch.rand(T1, 1) + 0.1,
+    }
+    # Patient 2: 16 hours
+    s2 = {
+        "vitals": torch.randn(T2, num_vitals),
+        "vitals_decay": torch.rand(T2, num_vitals),
+        "static": torch.tensor([0.6, 0.0]),
+        "mask": torch.ones(T2, dtype=torch.bool),
+        "los": torch.rand(T2, 1) + 0.1,
+    }
     
-    vitals = torch.randn(batch_size, seq_len, num_vitals)
-    # 1. Scalar target (batch_size, 1)
-    y_true_scalar = torch.rand(batch_size, 1) * 5.0 + 0.1
-    output = model(vitals=vitals, y_true=y_true_scalar)
-    assert output["y_prob"].shape == (batch_size, 1), "Pooled shape must be (batch_size, 1)"
-    assert not torch.isnan(output["loss"]), "Loss evaluated to NaN"
+    batch = collate_fn_dict_with_padding([s1, s2])
     
-    # 2. Sequence targets (batch_size, seq_len, 1) with variable length mask
-    y_true_seq = torch.rand(batch_size, seq_len, 1) * 5.0 + 0.1
-    mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
-    mask[0, 15:] = False  # Patient 0 stayed 15 hours
-    mask[1, 20:] = False  # Patient 1 stayed 20 hours
-    output_seq = model(vitals=vitals, y_true=y_true_seq, mask=mask)
-    assert output_seq["y_prob"].shape == (batch_size, 1)
-    assert not torch.isnan(output_seq["loss"])
+    # 1. Verify collation shapes and padding masks
+    assert batch["mask"].shape == (2, T2)
+    assert batch["mask"].sum(dim=1).tolist() == [T1, T2]
+    assert (batch["mask"][0, T1:] == False).all()
+    assert (batch["los"][0, T1:] == 0.0).all()
+    assert (batch["vitals"][0, T1:] == 0.0).all()
+    
+    # 2. Verify model execution in train() mode with optimizer backward step
+    model = TPC(dataset=None, continuous_dim=num_vitals, static_dim=2)
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer.zero_grad()
+    out = model(**batch)
+    assert "loss" in out
+    assert not torch.isnan(out["loss"])
+    out["loss"].backward()
+    optimizer.step()
 
 
 def test_tpc_multitask():
@@ -319,7 +339,7 @@ def test_tpc_no_decay_ablation():
     seq_len = 16
     num_vitals = 12
     
-    model = TPC(dataset=None, continuous_dim=num_vitals, sequence_output=True, use_decay=False)
+    model = TPC(dataset=None, continuous_dim=num_vitals, use_decay=False)
     vitals = torch.randn(batch_size, seq_len, num_vitals)
     y_true = torch.rand(batch_size, seq_len, 1) + 0.1
     mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
