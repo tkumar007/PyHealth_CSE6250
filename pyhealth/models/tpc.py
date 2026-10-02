@@ -29,15 +29,20 @@ class TPCBlock(nn.Module):
         static_dim: int,
         kernel_size: int = 3,
         dropout: float = 0.1,
+        use_decay: bool = True,
     ):
         super(TPCBlock, self).__init__()
         self.n = layer_idx
         self.k = kernel_size
         self.d = layer_idx  # Dilation increments by 1 with each layer (d = n)
         self.pad = self.d * (self.k - 1)  # Causal left-sided padding
+        self.use_decay = use_decay
         
         self.R_n = num_features + point_dim * (self.n - 1)  # Number of features
-        self.C_n = 2 if self.n == 1 else (temp_dim + 1)     # Channels per feature
+        if self.n == 1:
+            self.C_n = 2 if self.use_decay else 1
+        else:
+            self.C_n = temp_dim + 1
         self.temp_dim = temp_dim
         self.point_dim = point_dim
         self.static_dim = static_dim
@@ -55,8 +60,8 @@ class TPCBlock(nn.Module):
         self.temp_dropout = nn.Dropout(dropout)
         
         # 2. Pointwise Convolution (1x1 cross-feature interaction)
-        # Pointwise input dimension: flattened temporal input + static features + decay indicators
-        self.P_n = (self.R_n * self.C_n) + self.static_dim + num_features
+        decay_dim = num_features if self.use_decay else 0
+        self.P_n = (self.R_n * self.C_n) + self.static_dim + decay_dim
         self.pointwise_conv = nn.Conv1d(
             in_channels=self.P_n,
             out_channels=self.point_dim,
@@ -70,7 +75,7 @@ class TPCBlock(nn.Module):
         self,
         h: torch.Tensor,
         x_raw: torch.Tensor,
-        x_decay: torch.Tensor,
+        x_decay: torch.Tensor | None,
         s_expanded: torch.Tensor | None,
         prev_pointwise: list[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -79,7 +84,7 @@ class TPCBlock(nn.Module):
         Args:
             h: Input tensor of shape (batch, R_n, C_n, seq_len).
             x_raw: Raw time series of shape (batch, F, seq_len).
-            x_decay: Decay indicators of shape (batch, F, seq_len).
+            x_decay: Decay indicators of shape (batch, F, seq_len) or None.
             s_expanded: Static features of shape (batch, S, seq_len) or None.
             prev_pointwise: List of pointwise outputs from previous layers.
             
@@ -101,7 +106,8 @@ class TPCBlock(nn.Module):
         point_in_list = [h_flat]
         if s_expanded is not None and self.static_dim > 0:
             point_in_list.append(s_expanded)
-        point_in_list.append(x_decay)
+        if self.use_decay and x_decay is not None:
+            point_in_list.append(x_decay)
         point_in = torch.cat(point_in_list, dim=1)
         
         point_out = self.pointwise_conv(point_in)
@@ -144,6 +150,7 @@ class TPC(BaseModel):
         dropout (float): Dropout probability. Default: 0.1.
         loss_fn (str): Loss function to use ('msle' or 'mse'). Default: 'msle'.
         min_time (int): Prediction hour from which loss is computed. Default: 5.
+        floor_days (float): Minimum threshold floor for LoS (in days, ~30 mins = 1/48). Default: 1/48.
         sequence_output (bool): If True, returns hourly predictions (B, T, 1). If False,
             pools over time for a single patient summary prediction (B, 1). Default: True.
         multitask (bool): Whether to predict both LoS and in-hospital mortality. Default: False.
@@ -165,7 +172,9 @@ class TPC(BaseModel):
         dropout: float = 0.1,
         loss_fn: str = "msle",
         min_time: int = 5,
+        floor_days: float = 1.0 / 48.0,
         sequence_output: bool = True,
+        use_decay: bool = True,
         multitask: bool = False,
         alpha: float = 0.5,
         **kwargs,
@@ -182,7 +191,9 @@ class TPC(BaseModel):
         self.kernel_size = kernel_size
         self.loss_fn_type = loss_fn.lower()
         self.min_time = min_time
+        self.floor_days = floor_days
         self.sequence_output = sequence_output
+        self.use_decay = use_decay
         self.multitask = multitask
         self.alpha = alpha
         
@@ -196,6 +207,7 @@ class TPC(BaseModel):
                 static_dim=static_dim,
                 kernel_size=kernel_size,
                 dropout=dropout,
+                use_decay=use_decay,
             )
             for n in range(1, n_layers + 1)
         ])
@@ -243,7 +255,6 @@ class TPC(BaseModel):
             warmup_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
             warmup_mask[:, self.min_time:, :] = True
             combined_mask = valid_mask & warmup_mask
-            # If stay is shorter than min_time or all warmup masked, fallback to valid_mask for that patient
             for b in range(B):
                 if combined_mask[b].sum() == 0 and valid_mask[b].sum() > 0:
                     combined_mask[b] = valid_mask[b]
@@ -261,8 +272,8 @@ class TPC(BaseModel):
             y_t_b = y_true[b, m_b]
             
             if self.loss_fn_type == "msle":
-                log_pred = torch.log(torch.clamp(y_p_b, min=1e-5))
-                log_true = torch.log(torch.clamp(y_t_b, min=1e-5))
+                log_pred = torch.log(torch.clamp(y_p_b, min=self.floor_days))
+                log_true = torch.log(torch.clamp(y_t_b, min=self.floor_days))
                 patient_losses.append(torch.mean((log_pred - log_true) ** 2))
             else:
                 patient_losses.append(F.mse_loss(y_p_b, y_t_b))
@@ -272,7 +283,7 @@ class TPC(BaseModel):
             
         # Fallback if no valid mask entries
         if self.loss_fn_type == "msle":
-            return torch.mean((torch.log(torch.clamp(y_pred, min=1e-5)) - torch.log(torch.clamp(y_true, min=1e-5))) ** 2)
+            return torch.mean((torch.log(torch.clamp(y_pred, min=self.floor_days)) - torch.log(torch.clamp(y_true, min=self.floor_days))) ** 2)
         return F.mse_loss(y_pred, y_true)
 
     def forward(
@@ -297,20 +308,25 @@ class TPC(BaseModel):
         vitals_tensor = raw_vitals if raw_vitals.dim() == 3 else raw_vitals.unsqueeze(1)
         B, T, F_dim = vitals_tensor.shape
         
-        # 2. Extract or compute decay indicators: 0.75^j
-        raw_decay = kwargs.get("vitals_decay")
-        if isinstance(raw_decay, torch.Tensor):
-            vitals_decay = raw_decay
-        else:
-            raw_time_delta = kwargs.get("vitals_time_delta")
-            if isinstance(raw_time_delta, torch.Tensor):
-                vitals_decay = torch.pow(0.75, torch.clamp(raw_time_delta, min=0.0))
-            else:
-                vitals_decay = torch.ones_like(vitals_tensor)
-        
-        # Transpose for PyTorch Conv1d: (B, F, T)
+        # 2. Extract or compute decay indicators: 0.75^j (if use_decay is enabled)
         x_raw = vitals_tensor.transpose(1, 2).float()
-        x_decay = vitals_decay.transpose(1, 2).float()
+        if self.use_decay:
+            raw_decay = kwargs.get("vitals_decay")
+            if isinstance(raw_decay, torch.Tensor):
+                vitals_decay = raw_decay
+            else:
+                raw_time_delta = kwargs.get("vitals_time_delta")
+                if isinstance(raw_time_delta, torch.Tensor):
+                    vitals_decay = torch.pow(0.75, torch.clamp(raw_time_delta, min=0.0))
+                else:
+                    vitals_decay = torch.ones_like(vitals_tensor)
+            x_decay = vitals_decay.transpose(1, 2).float()
+            # Construct Layer 1 Input: 2 channels per feature [x'_t, x''_t] (Footnote 1)
+            h = torch.stack([x_raw, x_decay], dim=2)  # (B, F, 2, T)
+        else:
+            x_decay = None
+            # Ablation variant without decay indicators: 1 channel per feature [x'_t]
+            h = x_raw.unsqueeze(2)  # (B, F, 1, T)
         
         # 3. Extract static features (if any)
         raw_static = kwargs.get("static")
@@ -331,16 +347,13 @@ class TPC(BaseModel):
             else:
                 s_expanded = torch.zeros(B, self.static_dim, T, device=vitals_tensor.device)
                 
-        # 4. Construct Layer 1 Input: 2 channels per feature [x'_t, x''_t] (Footnote 1)
-        h = torch.stack([x_raw, x_decay], dim=2)  # (B, F, 2, T)
-        
-        # 5. Pass through stacked TPC blocks
+        # 4. Pass through stacked TPC blocks
         prev_pointwise: list[torch.Tensor] = []
         for block in self.blocks:
             h, point_out_ch = block(h, x_raw, x_decay, s_expanded, prev_pointwise)
             prev_pointwise.append(point_out_ch)
             
-        # 6. Prediction Head (Section 3.5 & Appendix A)
+        # 5. Prediction Head (Section 3.5 & Appendix A)
         final_R = self.continuous_dim + self.n_layers * self.point_dim
         final_C = self.temp_dim + 1
         h_final = h.view(B, final_R * final_C, T)
@@ -350,11 +363,12 @@ class TPC(BaseModel):
         else:
             final_in = h_final
             
-        feat = self.head_dropout(self.head_bn1(F.relu(self.head_conv1(final_in))))
+        # Pointwise conv -> BatchNorm -> ReLU -> Dropout (Appendix A)
+        feat = self.head_dropout(F.relu(self.head_bn1(self.head_conv1(final_in))))
         los_out = self.head_fc(feat).transpose(1, 2)  # (B, T, 1)
         
-        # Softplus guarantees smooth positive gradients and prevents dying ReLUs
-        y_prob = F.softplus(los_out) + 1e-3
+        # Softplus with matching floor prevents dying ReLUs and log singularities
+        y_prob = F.softplus(los_out) + self.floor_days
         
         raw_mask = kwargs.get("mask")
         mask_tensor = raw_mask if isinstance(raw_mask, torch.Tensor) else None
@@ -379,10 +393,22 @@ class TPC(BaseModel):
             
         if isinstance(raw_y_true, torch.Tensor):
             y_true_tensor = raw_y_true.float()
-            result["y_true"] = y_true_tensor
-            result["loss"] = self._compute_loss(y_prob, y_true_tensor, mask=mask_tensor)
             
-            # Multitask in-hospital mortality loss (evaluated across valid timesteps)
+            # If model is pooled (B, 1) but sequence targets (B, T, 1) were supplied, pool targets similarly
+            if not self.sequence_output and y_true_tensor.dim() >= 2 and y_true_tensor.shape[1] > 1:
+                if mask_tensor is not None:
+                    lengths = mask_tensor.sum(dim=1).long()
+                    last_idx = torch.clamp(lengths - 1, min=0)
+                    y_true_eval = torch.stack([y_true_tensor[b, last_idx[b], :] for b in range(B)], dim=0)
+                else:
+                    y_true_eval = y_true_tensor[:, -1:, :]
+                result["y_true"] = y_true_eval
+                result["loss"] = self._compute_loss(y_prob, y_true_eval)
+            else:
+                result["y_true"] = y_true_tensor
+                result["loss"] = self._compute_loss(y_prob, y_true_tensor, mask=mask_tensor)
+            
+            # Multitask in-hospital mortality loss
             if self.multitask and hasattr(self, "mort_fc"):
                 mort_out = self.mort_fc(feat).transpose(1, 2)
                 mort_prob = torch.sigmoid(mort_out)
