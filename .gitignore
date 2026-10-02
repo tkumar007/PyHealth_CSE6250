@@ -155,3 +155,37 @@ test-resources/meds_demo/
 
 # Tool caches
 .ruff_cache/
+data/mimiciv/demo/demo_subject_id.csv
+data/mimiciv/demo/LICENSE.txt
+data/mimiciv/demo/README.txt
+data/mimiciv/demo/SHA256SUMS.txt
+data/mimiciv/demo/hosp/admissions.csv.gz
+data/mimiciv/demo/hosp/d_hcpcs.csv.gz
+data/mimiciv/demo/hosp/d_icd_diagnoses.csv.gz
+data/mimiciv/demo/hosp/d_icd_procedures.csv.gz
+data/mimiciv/demo/hosp/d_labitems.csv.gz
+data/mimiciv/demo/hosp/diagnoses_icd.csv.gz
+data/mimiciv/demo/hosp/drgcodes.csv.gz
+data/mimiciv/demo/hosp/emar_detail.csv.gz
+data/mimiciv/demo/hosp/emar.csv.gz
+data/mimiciv/demo/hosp/hcpcsevents.csv.gz
+data/mimiciv/demo/hosp/labevents.csv.gz
+data/mimiciv/demo/hosp/microbiologyevents.csv.gz
+data/mimiciv/demo/hosp/omr.csv.gz
+data/mimiciv/demo/hosp/patients.csv.gz
+data/mimiciv/demo/hosp/pharmacy.csv.gz
+data/mimiciv/demo/hosp/poe_detail.csv.gz
+data/mimiciv/demo/hosp/poe.csv.gz
+data/mimiciv/demo/hosp/prescriptions.csv.gz
+data/mimiciv/demo/hosp/procedures_icd.csv.gz
+data/mimiciv/demo/hosp/provider.csv.gz
+data/mimiciv/demo/hosp/services.csv.gz
+data/mimiciv/demo/hosp/transfers.csv.gz
+data/mimiciv/demo/icu/caregiver.csv.gz
+data/mimiciv/demo/icu/chartevents.csv.gz
+data/mimiciv/demo/icu/d_items.csv.gz
+data/mimiciv/demo/icu/datetimeevents.csv.gz
+data/mimiciv/demo/icu/icustays.csv.gz
+data/mimiciv/demo/icu/ingredientevents.csv.gz
+data/mimiciv/demo/icu/inputevents.csv.gz
+data/mimiciv/demo/icu/procedureevents.csv.gz

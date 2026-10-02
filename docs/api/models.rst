@@ -215,6 +215,7 @@ API Reference
     models/pyhealth.models.MedFuse
     models/pyhealth.models.MedLink
     models/pyhealth.models.TCN
+    models/pyhealth.models.TPC
     models/pyhealth.models.TFMTokenizer
     models/pyhealth.models.GAN
     models/pyhealth.models.VAE
