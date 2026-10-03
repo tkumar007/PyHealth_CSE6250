@@ -28,8 +28,9 @@ Implementation Notes & Methodological Alignment:
      feature selection or statistics computation.
    - Lab selection and normalization parameters computed strictly on train split
      with 1st/99th percentile clipping.
-   - Baseline measurements restricted to [-24h, +5h] relative to ICU admission,
-     strictly preventing lookahead leakage.
+   - Baseline measurements restricted to [-24h, +5h] relative to ICU admission;
+     lookahead leakage is prevented for predictions at t >= 4h (enforced via
+     warmup evaluation mask and min_time=4 on both LoS and mortality losses).
 3. Hourly Discretization & Decay Indicators:
    - Hourly aggregation from ICU admission out to 14 days (336 hours).
    - Exponential decay: x''_t = 0.75^j, where j is elapsed hours since last recording.
@@ -52,7 +53,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Sampler
-from pyhealth.datasets import MIMIC4Dataset, collate_fn_dict_with_padding, get_dataloader
+from pyhealth.datasets import MIMIC4Dataset, collate_fn_dict_with_padding
 from pyhealth.tasks import BaseTask
 from pyhealth.models.tpc import TPC
 
@@ -109,6 +110,7 @@ def select_qualifying_labs(
     
     Evaluates ICU stays strictly on the training set to prevent data leakage.
     Counts measurements strictly within each ICU stay window [in_time, min(out_time, in_time + 14d)).
+    Cohort filters (adults > 18, stays >= 5 hours) match the task definition exactly.
     
     Returns:
         selected_labs: List of item IDs.
@@ -121,6 +123,13 @@ def select_qualifying_labs(
     for patient in dataset.iter_patients():
         if str(patient.patient_id) not in train_pids:
             continue
+
+        patients_info = patient.get_events("patients")
+        if not patients_info:
+            continue
+        anchor_age = float(patients_info[0].attr_dict.get("anchor_age", 0))
+        anchor_year = float(patients_info[0].attr_dict.get("anchor_year", 0))
+
         icustays = patient.get_events("icustays")
         labs = patient.get_events("labevents")
 
@@ -136,6 +145,16 @@ def select_qualifying_labs(
                     out_time = datetime.strptime(str(out_time_raw), "%Y-%m-%d %H:%M:%S")
                 except (ValueError, TypeError):
                     continue
+
+            # Cohort filter: Adult ICU patients (> 18 years at admission)
+            true_age = float(in_time.year - anchor_year + anchor_age)
+            if true_age <= 18:
+                continue
+
+            # Cohort filter: Minimum ICU length of stay >= 5 hours
+            stay_hours = int((out_time - in_time).total_seconds() // 3600)
+            if stay_hours < 5:
+                continue
                     
             stay_end = min(out_time, in_time + timedelta(days=14))
             total_train_stays += 1
@@ -172,13 +191,20 @@ def select_qualifying_labs(
 def load_chartevents_cache(
     ehr_root: str,
     dataset: MIMIC4Dataset,
-) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, float]]]:
+) -> tuple[dict[str, list[tuple[int, str, float]]], dict[str, dict[str, float]]]:
     """Loads bedside vital signs and admission-window baseline measurements from chartevents.
     
-    Adheres to Rocheteau et al. (flat_features.sql):
+    Adheres to Rocheteau et al. (flat_features.sql & timeseries.sql):
+    - Vital signs are sorted chronologically by charttime so "last value in the hour wins"
+      strictly follows temporal order rather than file order.
+    - Continuous vitals are returned as lightweight (hour, item_id, val) primitive tuples
+      rather than nested dictionaries with Timestamp objects. This reduces serialization
+      and RAM overhead and eliminates pickling bottlenecks across multiprocessing workers.
+    - Preserves legitimate zero/negative clinical measurements in chartevents (filtering
+      non-positive values specifically for physical dimensions like height and weight).
     - Baseline measurements are restricted strictly to [-24h, +5h] relative to ICU admission.
     - If multiple baseline measurements exist in the window, sorts by proximity to admission time.
-    - Vitally prevents any future information leakage.
+    - itertuples() is used for efficient row extraction in this demo data adapter.
     """
     chart_path = os.path.join(ehr_root, "icu", "chartevents.csv.gz")
     if not os.path.exists(chart_path):
@@ -188,7 +214,7 @@ def load_chartevents_cache(
         chart_path,
         usecols=["stay_id", "charttime", "itemid", "valuenum"],
     )
-    df_chart = df_chart[df_chart["valuenum"].notnull() & (df_chart["valuenum"] > 0)]
+    df_chart = df_chart[df_chart["valuenum"].notnull()]
     df_chart["charttime"] = pd.to_datetime(df_chart["charttime"])
 
     # Build lookup of admission intime per stay_id from PyHealth dataset
@@ -199,12 +225,22 @@ def load_chartevents_cache(
             if sid and stay.timestamp is not None:
                 stay_intimes[sid] = stay.timestamp
 
-    # 1. Continuous vital signs across the stay
-    vitals_by_stay: dict[str, list[dict[str, Any]]] = {}
+    # 1. Continuous vital signs across the stay (sorted chronologically)
+    vitals_by_stay: dict[str, list[tuple[int, str, float]]] = {}
     vitals_ids = set(int(k) for k in CORE_VITALS_MAP.keys())
-    df_v = df_chart[df_chart["itemid"].isin(vitals_ids)]
+    df_v = df_chart[df_chart["itemid"].isin(vitals_ids)].sort_values(by="charttime")
     for stay_id, grp in df_v.groupby("stay_id"):
-        vitals_by_stay[str(stay_id)] = grp[["charttime", "itemid", "valuenum"]].to_dict("records")
+        sid_str = str(stay_id)
+        if sid_str not in stay_intimes:
+            continue
+        in_time = stay_intimes[sid_str]
+        offsets = ((grp["charttime"] - in_time).dt.total_seconds() // 3600).astype(int)
+        records = []
+        for h, itemid, val in zip(offsets, grp["itemid"], grp["valuenum"]):
+            if h >= 0:
+                records.append((int(h), str(itemid), float(val)))
+        if records:
+            vitals_by_stay[sid_str] = records
 
     # 2. Baseline static measurements restricted strictly to [-24h, +5h] of admission
     baseline_static_by_stay: dict[str, dict[str, float]] = {}
@@ -228,10 +264,14 @@ def load_chartevents_cache(
         windowed.sort_values(by="abs_offset", inplace=True)
         
         d: dict[str, float] = {}
-        for _, row in windowed.iterrows():
-            feat_name = BASELINE_STATIC_ITEMS[int(row["itemid"])]
+        for row in windowed.itertuples(index=False):
+            feat_name = BASELINE_STATIC_ITEMS[int(row.itemid)]
+            val = float(row.valuenum)
+            # Filter non-positive values only for physical dimensions (height, weight)
+            if feat_name in ("height", "weight") and val <= 0:
+                continue
             if feat_name not in d:
-                d[feat_name] = float(row["valuenum"])
+                d[feat_name] = val
         baseline_static_by_stay[sid_str] = d
 
     return vitals_by_stay, baseline_static_by_stay
@@ -241,7 +281,7 @@ def compute_empirical_training_stats(
     dataset: MIMIC4Dataset,
     train_pids: set[str],
     lab_item_ids: list[str],
-    vitals_by_stay: dict[str, list[dict[str, Any]]] | None = None,
+    vitals_by_stay: dict[str, list[tuple[int, str, float]]] | None = None,
     baseline_static_by_stay: dict[str, dict[str, float]] | None = None,
 ) -> tuple[
     dict[str, tuple[float, float]],
@@ -251,12 +291,17 @@ def compute_empirical_training_stats(
 ]:
     """Computes empirical training statistics and builds fixed categorical vocabularies.
     
-    Strictly isolated to the training split:
+    Strictly isolated to the training split and identical cohort filters (adults > 18, stays >= 5h):
     - Time-series: empirical mean and std with 1st/99th percentile clipping.
     - Continuous static: empirical mean, std, and median (for imputation) on training stays.
     - Categorical static: deterministic sorted vocabulary for one-hot encoding.
     """
     ts_vals: dict[str, list[float]] = {item: [] for item in lab_item_ids}
+    if vitals_by_stay:
+        for vid in CORE_VITALS_MAP.keys():
+            if vid not in ts_vals:
+                ts_vals[vid] = []
+
     continuous_static_vals: dict[str, list[float]] = {
         "age": [], "height": [], "weight": [], "eyes": [], "motor": [], "verbal": []
     }
@@ -273,7 +318,10 @@ def compute_empirical_training_stats(
         if str(patient.patient_id) not in train_pids:
             continue
             
-        p_info = patient.get_events("patients")[0]
+        patients_info = patient.get_events("patients")
+        if not patients_info:
+            continue
+        p_info = patients_info[0]
         anchor_age = float(p_info.attr_dict.get("anchor_age", 0))
         anchor_year = float(p_info.attr_dict.get("anchor_year", 0))
         
@@ -294,6 +342,17 @@ def compute_empirical_training_stats(
                     out_time = datetime.strptime(str(out_time_raw), "%Y-%m-%d %H:%M:%S")
                 except (ValueError, TypeError):
                     continue
+
+            # Cohort filter: Adult ICU patients (> 18 years at admission)
+            true_age = float(in_time.year - anchor_year + anchor_age)
+            if true_age <= 18:
+                continue
+
+            # Cohort filter: Minimum ICU length of stay >= 5 hours
+            stay_hours = int((out_time - in_time).total_seconds() // 3600)
+            if stay_hours < 5:
+                continue
+
             stay_end = min(out_time, in_time + timedelta(days=14))
             
             sid = str(stay.attr_dict.get("stay_id", ""))
@@ -301,7 +360,6 @@ def compute_empirical_training_stats(
             train_stay_ids.add(sid)
             
             # Static continuous age
-            true_age = float(in_time.year - anchor_year + anchor_age)
             continuous_static_vals["age"].append(true_age)
             
             # Static categoricals
@@ -335,14 +393,10 @@ def compute_empirical_training_stats(
 
     # Collect vitals values from training stays
     if vitals_by_stay:
-        for vid in CORE_VITALS_MAP.keys():
-            if vid not in ts_vals:
-                ts_vals[vid] = []
-            int_vid = int(vid)
-            for sid in train_stay_ids:
-                for rec in vitals_by_stay.get(sid, []):
-                    if rec["itemid"] == int_vid:
-                        ts_vals[vid].append(float(rec["valuenum"]))
+        for sid in train_stay_ids:
+            for hour, item_id, val in vitals_by_stay.get(sid, []):
+                if item_id in ts_vals:
+                    ts_vals[item_id].append(val)
 
     # 1. Empirical time-series normalization stats (mean, std)
     ts_stats: dict[str, tuple[float, float]] = {}
@@ -432,6 +486,13 @@ class LengthOfStayTask(BaseTask):
     - Capped at first 14 days (336 hours).
     - Target: Remaining LoS in days anchored at the end of each hour t:
       y_t = max((out_time - (in_time + t + 1 hours)) / 24.0, 1/48 days).
+
+    PyHealth Caching & Multiprocessing Worker Serialization:
+    - BaseDataset.set_task hashes vars(task) via uuid5 to determine cache directories,
+      so any change to task parameters or vitals/stat dictionaries invalidates the cache.
+    - vitals_by_stay is stored as compact (hour, item_id, val) primitive tuples rather
+      than nested dicts with Timestamp objects, minimizing memory and eliminating
+      multiprocessing worker pickling bottlenecks on large datasets.
     """
     task_name = "ICU Remaining Length of Stay Prediction"
     
@@ -451,7 +512,7 @@ class LengthOfStayTask(BaseTask):
         self,
         lab_item_ids: list[str] | None = None,
         norm_stats: dict[str, tuple[float, float]] | None = None,
-        vitals_by_stay: dict[str, list[dict[str, Any]]] | None = None,
+        vitals_by_stay: dict[str, list[tuple[int, str, float]]] | None = None,
         baseline_static_by_stay: dict[str, dict[str, float]] | None = None,
         static_stats: dict[str, tuple[float, float, float]] | None = None,
         cat_vocabs: dict[str, list[str]] | None = None,
@@ -523,6 +584,8 @@ class LengthOfStayTask(BaseTask):
             lab for lab in raw_labs
             if str(lab.attr_dict.get("itemid", "")).split(".")[0] in self.feature_map and lab.timestamp is not None
         ]
+        # Chronological sort: guarantees "last value in the hour wins" follows time, not file order
+        patient_labs.sort(key=lambda lab: lab.timestamp)
         
         hadm_expire_map: dict[str, bool] = {}
         adm_meta_map: dict[str, dict[str, str]] = {}
@@ -576,16 +639,13 @@ class LengthOfStayTask(BaseTask):
             mask = torch.zeros((T, self.num_features), dtype=torch.float32)
             
             # 1. Bedside vital signs from chartevents (if provided)
+            # Pre-sorted chronologically: last value in the hour overwrites earlier ones
             if self.vitals_by_stay and stay_id_str in self.vitals_by_stay:
-                for rec in self.vitals_by_stay[stay_id_str]:
-                    v_time = rec["charttime"]
-                    item_id = str(rec["itemid"])
+                for hour, item_id, val in self.vitals_by_stay[stay_id_str]:
                     if item_id not in self.feature_map:
                         continue
                     f_idx = self.feature_map[item_id]
-                    hour = int((v_time - in_time).total_seconds() // 3600)
                     if 0 <= hour < T:
-                        val = float(rec["valuenum"])
                         mean, std = self.norm_stats.get(item_id, (0.0, 1.0))
                         raw_grid[hour, f_idx] = (val - mean) / (std if std > 1e-4 else 1.0)
                         mask[hour, f_idx] = 1.0

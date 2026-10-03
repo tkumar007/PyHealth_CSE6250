@@ -395,8 +395,17 @@ class TPC(BaseModel):
                     mort_true = raw_mort.float().view(-1, 1, 1).expand_as(mort_out)
                     if mask_tensor is not None:
                         m_valid = mask_tensor.bool().unsqueeze(-1)
-                        if m_valid.sum() > 0:
-                            mort_loss = F.binary_cross_entropy_with_logits(mort_out[m_valid], mort_true[m_valid])
+                        # Apply matching warmup mask (t >= min_time) to prevent lookahead leak from admission baselines
+                        if T > self.min_time:
+                            warmup_m = torch.zeros_like(m_valid)
+                            warmup_m[:, self.min_time:, :] = True
+                            m_eval = m_valid & warmup_m
+                            no_eval = (m_eval.sum(dim=(1, 2)) == 0) & (m_valid.sum(dim=(1, 2)) > 0)
+                            m_eval[no_eval] = m_valid[no_eval]
+                        else:
+                            m_eval = m_valid
+                        if m_eval.sum() > 0:
+                            mort_loss = F.binary_cross_entropy_with_logits(mort_out[m_eval], mort_true[m_eval])
                         else:
                             mort_loss = F.binary_cross_entropy_with_logits(mort_out, mort_true)
                     else:
