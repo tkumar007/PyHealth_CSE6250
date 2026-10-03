@@ -6,20 +6,30 @@ Reproduces the computational pipeline and experimental protocol of:
     Emma Rocheteau, Pietro Liò, Stephanie Hyland (ACM CHIL 2021)
     https://doi.org/10.1145/3450439.3451860
 
-Architecture & Pipeline Alignment with Rocheteau et al.:
+Implementation Notes & Methodological Alignment:
 1. Multi-Modal Clinical Feature Pipeline:
    - Dynamic Time-Series Features:
      • 7 Core Bedside Vital Signs from chartevents (Heart Rate, Systolic BP,
        Diastolic BP, Mean BP, Respiration, SpO2, Temperature).
-     • Laboratory Blood Tests dynamically selected from training cohort matching
-       the paper's exact inclusion threshold (>= 25% stay prevalence and > 3 obs/stay).
-   - 12 Static (Flat) Features matching Section 4.2 & Table 6:
-     • Age, Gender, Admission Hour, Height, Weight, GCS Eyes, GCS Motor,
-       GCS Verbal, Care Unit, Admission Location, Insurance, Race.
+     • Laboratory Blood Tests dynamically selected on the training split
+       matching the authors' official preprocessing pipeline (>= 25% stay
+       prevalence and > 3 obs/stay within the stay window).
+       Source: EmmaRocheteau/TPC-LoS-prediction (MIMIC_preprocessing/timeseries.sql).
+   - Static (Flat) Features matching Section 4.2, Table 6, and flat_features.sql:
+     • Continuous: Age, Admission Hour, Height, Weight, GCS Eyes, GCS Motor,
+       GCS Verbal, Gender.
+     • Missingness Indicators: Binary flags for unmeasured baseline height,
+       weight, and GCS in the admission window [-24h, +5h].
+     • Categorical (One-Hot Encoded with Unknown Slot): First Care Unit,
+       Admission Location, Insurance, Race/Ethnicity. Vocabularies and
+       empirical medians/means are built strictly from the training split.
 2. Data Leakage Prevention & Empirical Normalization:
-   - Cohort split into Train (70%), Val (15%), Test (15%) before feature extraction.
-   - Empirical mean/std computed strictly on training split with 1st/99th percentile clipping.
-   - Standardized missing values filled with 0.0 represent the true population training mean.
+   - Patient cohort partitioned into Train (70%), Val (15%), Test (15%) before
+     feature selection or statistics computation.
+   - Lab selection and normalization parameters computed strictly on train split
+     with 1st/99th percentile clipping.
+   - Baseline measurements restricted to [-24h, +5h] relative to ICU admission,
+     strictly preventing lookahead leakage.
 3. Hourly Discretization & Decay Indicators:
    - Hourly aggregation from ICU admission out to 14 days (336 hours).
    - Exponential decay: x''_t = 0.75^j, where j is elapsed hours since last recording.
@@ -27,8 +37,10 @@ Architecture & Pipeline Alignment with Rocheteau et al.:
    - Remaining LoS in days anchored to the end of each hour t with a 30-minute floor.
 5. Multitask Learning:
    - Joint hourly LoS regression (MSLE) + in-hospital mortality prediction (BCEWithLogits).
-6. Length-Bucketed Batch Sampling:
-   - Groups stays of similar length to minimize padding, shuffling batch order every epoch.
+6. Length-Bucketed Batch Sampling & Unconfounded Ablation:
+   - Groups stays of similar length to minimize padding overhead.
+   - Resets epoch counters and shares identical random seeds across configurations,
+     ensuring strictly identical batch sequences and weight initializations.
 """
 
 from collections.abc import Iterator
@@ -44,7 +56,8 @@ from pyhealth.datasets import MIMIC4Dataset, collate_fn_dict_with_padding, get_d
 from pyhealth.tasks import BaseTask
 from pyhealth.models.tpc import TPC
 
-# 7 Core Bedside Vital Signs from chartevents (Rocheteau et al. CHIL 2021)
+# 7 Core Bedside Vital Signs from chartevents
+# (Derived from EmmaRocheteau/TPC-LoS-prediction/MIMIC_preprocessing/timeseries.sql)
 CORE_VITALS_MAP = {
     "220045": "Heart Rate",
     "220179": "NIBP Systolic",
@@ -55,7 +68,8 @@ CORE_VITALS_MAP = {
     "223761": "Temperature (F)",
 }
 
-# Baseline clinical assessments extracted within admission window (Section 4.2 / Table 6)
+# Baseline clinical assessments extracted within admission window [-24h, +5h]
+# (Derived from EmmaRocheteau/TPC-LoS-prediction/MIMIC_preprocessing/flat_features.sql)
 BASELINE_STATIC_ITEMS = {
     226512: "weight",
     226730: "height",
@@ -64,7 +78,7 @@ BASELINE_STATIC_ITEMS = {
     223900: "verbal",
 }
 
-# Fallback core lab tests if dynamic selection is not used (for standalone testing)
+# Default clinical lab tests used if dataset is too small for statistical thresholding
 DEFAULT_LAB_ITEMS = [
     "50868",  # Anion Gap
     "50882",  # Bicarbonate
@@ -90,13 +104,15 @@ def select_qualifying_labs(
     min_prevalence: float = 0.25,
     min_avg_obs: float = 3.0,
     max_labs: int = 45,
-) -> list[str]:
+) -> tuple[list[str], bool]:
     """Dynamically selects laboratory tests conforming to the paper's inclusion rule.
     
-    Rocheteau et al. (ACM CHIL 2021, Section 4 & timeseries.sql):
-    - Evaluates ICU stays in the training set to prevent data leakage.
-    - Laboratory variables must be present in >= 25% of patient stays with > 3 observations per stay.
-    - Selects up to `max_labs` (the paper selected 45 lab features in MIMIC-IV).
+    Evaluates ICU stays strictly on the training set to prevent data leakage.
+    Counts measurements strictly within each ICU stay window [in_time, min(out_time, in_time + 14d)).
+    
+    Returns:
+        selected_labs: List of item IDs.
+        threshold_met: True if selected via statistical thresholds, False if fallback was used.
     """
     total_train_stays = 0
     obs_per_lab: dict[str, int] = {}
@@ -108,16 +124,33 @@ def select_qualifying_labs(
         icustays = patient.get_events("icustays")
         labs = patient.get_events("labevents")
 
-        for _ in icustays:
+        for stay in icustays:
+            in_time = stay.timestamp
+            out_time_raw = stay.attr_dict.get("outtime")
+            if in_time is None or out_time_raw is None:
+                continue
+            if isinstance(out_time_raw, datetime):
+                out_time = out_time_raw
+            else:
+                try:
+                    out_time = datetime.strptime(str(out_time_raw), "%Y-%m-%d %H:%M:%S")
+                except (ValueError, TypeError):
+                    continue
+                    
+            stay_end = min(out_time, in_time + timedelta(days=14))
             total_train_stays += 1
-            stay_labs = set()
+            stay_labs: set[str] = set()
+            
             for lab in labs:
+                if lab.timestamp is None or not (in_time <= lab.timestamp < stay_end):
+                    continue
                 item_raw = lab.attr_dict.get("itemid")
                 val = lab.attr_dict.get("valuenum")
                 if item_raw is not None and val is not None:
                     item_id = str(item_raw).split(".")[0]
                     stay_labs.add(item_id)
                     obs_per_lab[item_id] = obs_per_lab.get(item_id, 0) + 1
+                    
             for item_id in stay_labs:
                 stays_per_lab[item_id] = stays_per_lab.get(item_id, 0) + 1
 
@@ -128,126 +161,232 @@ def select_qualifying_labs(
         if prev >= min_prevalence and avg_obs > min_avg_obs:
             qualifying.append((prev, avg_obs, item_id))
 
-    # Sort descending by stay prevalence, then average observations
     qualifying.sort(key=lambda x: (x[0], x[1]), reverse=True)
     selected = [item_id for _, _, item_id in qualifying[:max_labs]]
 
     if len(selected) < 5:
-        # Fallback to defaults if training set is too small
-        return DEFAULT_LAB_ITEMS
-    return selected
+        return DEFAULT_LAB_ITEMS, False
+    return selected, True
 
 
 def load_chartevents_cache(
     ehr_root: str,
+    dataset: MIMIC4Dataset,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, float]]]:
-    """Loads bedside vital signs and baseline clinical measurements from chartevents.csv.gz.
+    """Loads bedside vital signs and admission-window baseline measurements from chartevents.
     
-    Extracts:
-    - 7 core continuous ICU vitals across the stay.
-    - 5 baseline static features: Admission Weight, Height, GCS Eyes, GCS Motor, GCS Verbal.
+    Adheres to Rocheteau et al. (flat_features.sql):
+    - Baseline measurements are restricted strictly to [-24h, +5h] relative to ICU admission.
+    - If multiple baseline measurements exist in the window, sorts by proximity to admission time.
+    - Vitally prevents any future information leakage.
     """
     chart_path = os.path.join(ehr_root, "icu", "chartevents.csv.gz")
     if not os.path.exists(chart_path):
-        print(f"Notice: {chart_path} not found. Proceeding with labevents only.")
         return {}, {}
 
     df_chart = pd.read_csv(
         chart_path,
         usecols=["stay_id", "charttime", "itemid", "valuenum"],
     )
-    df_chart = df_chart[df_chart["valuenum"].notnull()]
+    df_chart = df_chart[df_chart["valuenum"].notnull() & (df_chart["valuenum"] > 0)]
     df_chart["charttime"] = pd.to_datetime(df_chart["charttime"])
 
-    # Extract continuous vitals
+    # Build lookup of admission intime per stay_id from PyHealth dataset
+    stay_intimes: dict[str, datetime] = {}
+    for patient in dataset.iter_patients():
+        for stay in patient.get_events("icustays"):
+            sid = str(stay.attr_dict.get("stay_id", ""))
+            if sid and stay.timestamp is not None:
+                stay_intimes[sid] = stay.timestamp
+
+    # 1. Continuous vital signs across the stay
     vitals_by_stay: dict[str, list[dict[str, Any]]] = {}
     vitals_ids = set(int(k) for k in CORE_VITALS_MAP.keys())
     df_v = df_chart[df_chart["itemid"].isin(vitals_ids)]
     for stay_id, grp in df_v.groupby("stay_id"):
         vitals_by_stay[str(stay_id)] = grp[["charttime", "itemid", "valuenum"]].to_dict("records")
 
-    # Extract baseline static features
+    # 2. Baseline static measurements restricted strictly to [-24h, +5h] of admission
     baseline_static_by_stay: dict[str, dict[str, float]] = {}
-    df_s = df_chart[df_chart["itemid"].isin(BASELINE_STATIC_ITEMS.keys())]
+    df_s = df_chart[df_chart["itemid"].isin(BASELINE_STATIC_ITEMS.keys())].copy()
+    
     for stay_id, grp in df_s.groupby("stay_id"):
+        sid_str = str(stay_id)
+        if sid_str not in stay_intimes:
+            continue
+        in_time = stay_intimes[sid_str]
+        
+        # Calculate offset in hours relative to admission intime
+        grp_offsets = (grp["charttime"] - in_time).dt.total_seconds() / 3600.0
+        # Restrict strictly between -24h and +5h (flat_features.sql)
+        windowed = grp[(grp_offsets >= -24.0) & (grp_offsets <= 5.0)].copy()
+        if len(windowed) == 0:
+            continue
+            
+        # Sort by distance to admission time to select closest baseline measurement
+        windowed["abs_offset"] = ((windowed["charttime"] - in_time).dt.total_seconds()).abs()
+        windowed.sort_values(by="abs_offset", inplace=True)
+        
         d: dict[str, float] = {}
-        for _, row in grp.iterrows():
+        for _, row in windowed.iterrows():
             feat_name = BASELINE_STATIC_ITEMS[int(row["itemid"])]
             if feat_name not in d:
                 d[feat_name] = float(row["valuenum"])
-        baseline_static_by_stay[str(stay_id)] = d
+        baseline_static_by_stay[sid_str] = d
 
     return vitals_by_stay, baseline_static_by_stay
 
 
-def compute_empirical_stats(
+def compute_empirical_training_stats(
     dataset: MIMIC4Dataset,
-    train_pids: set[str] | list[str] | None,
+    train_pids: set[str],
     lab_item_ids: list[str],
     vitals_by_stay: dict[str, list[dict[str, Any]]] | None = None,
-) -> tuple[dict[str, tuple[float, float]], dict[str, int]]:
-    """Computes empirical mean and std for each feature with 1st/99th percentile outlier clipping.
+    baseline_static_by_stay: dict[str, dict[str, float]] | None = None,
+) -> tuple[
+    dict[str, tuple[float, float]],
+    dict[str, int],
+    dict[str, tuple[float, float, float]],
+    dict[str, list[str]],
+]:
+    """Computes empirical training statistics and builds fixed categorical vocabularies.
     
-    Computed strictly on the training patient split to avoid data leakage.
-    Ensures that unobserved values (filled with 0 after z-score standardization)
-    accurately represent the empirical population mean (0.0).
+    Strictly isolated to the training split:
+    - Time-series: empirical mean and std with 1st/99th percentile clipping.
+    - Continuous static: empirical mean, std, and median (for imputation) on training stays.
+    - Categorical static: deterministic sorted vocabulary for one-hot encoding.
     """
-    allowed_pids = set(train_pids) if train_pids is not None else None
-    vals_by_item: dict[str, list[float]] = {item: [] for item in lab_item_ids}
+    ts_vals: dict[str, list[float]] = {item: [] for item in lab_item_ids}
+    continuous_static_vals: dict[str, list[float]] = {
+        "age": [], "height": [], "weight": [], "eyes": [], "motor": [], "verbal": []
+    }
+    cat_sets: dict[str, set[str]] = {
+        "first_careunit": set(),
+        "admission_location": set(),
+        "insurance": set(),
+        "race": set(),
+    }
     
-    # Collect lab values from training split
+    train_stay_ids: set[str] = set()
+
     for patient in dataset.iter_patients():
-        if allowed_pids is not None and str(patient.patient_id) not in allowed_pids:
+        if str(patient.patient_id) not in train_pids:
             continue
-        for lab in patient.get_events("labevents"):
-            item_raw = lab.attr_dict.get("itemid")
-            val = lab.attr_dict.get("valuenum")
-            if item_raw is not None and val is not None:
-                item_id = str(item_raw).split(".")[0]
-                if item_id in vals_by_item:
-                    try:
-                        vals_by_item[item_id].append(float(val))
-                    except (ValueError, TypeError):
-                        pass
+            
+        p_info = patient.get_events("patients")[0]
+        anchor_age = float(p_info.attr_dict.get("anchor_age", 0))
+        anchor_year = float(p_info.attr_dict.get("anchor_year", 0))
+        
+        admissions = patient.get_events("admissions")
+        adm_map = {str(a.attr_dict.get("hadm_id")): a for a in admissions}
+        icustays = patient.get_events("icustays")
+
+        # Collect lab values within ICU stays
+        for stay in icustays:
+            in_time = stay.timestamp
+            out_time_raw = stay.attr_dict.get("outtime")
+            if in_time is None or out_time_raw is None:
+                continue
+            if isinstance(out_time_raw, datetime):
+                out_time = out_time_raw
+            else:
+                try:
+                    out_time = datetime.strptime(str(out_time_raw), "%Y-%m-%d %H:%M:%S")
+                except (ValueError, TypeError):
+                    continue
+            stay_end = min(out_time, in_time + timedelta(days=14))
+            
+            sid = str(stay.attr_dict.get("stay_id", ""))
+            hadm_id = str(stay.attr_dict.get("hadm_id", ""))
+            train_stay_ids.add(sid)
+            
+            # Static continuous age
+            true_age = float(in_time.year - anchor_year + anchor_age)
+            continuous_static_vals["age"].append(true_age)
+            
+            # Static categoricals
+            cat_sets["first_careunit"].add(str(stay.attr_dict.get("first_careunit", "")))
+            if hadm_id in adm_map:
+                adm = adm_map[hadm_id]
+                cat_sets["admission_location"].add(str(adm.attr_dict.get("admission_location", "")))
+                cat_sets["insurance"].add(str(adm.attr_dict.get("insurance", "")))
+                cat_sets["race"].add(str(adm.attr_dict.get("race", "")))
+                
+            # Baseline measurements from admission window
+            if baseline_static_by_stay and sid in baseline_static_by_stay:
+                base = baseline_static_by_stay[sid]
+                for k in ["height", "weight", "eyes", "motor", "verbal"]:
+                    if k in base:
+                        continuous_static_vals[k].append(base[k])
+
+            # Labs within stay
+            for lab in patient.get_events("labevents"):
+                if lab.timestamp is None or not (in_time <= lab.timestamp < stay_end):
+                    continue
+                item_raw = lab.attr_dict.get("itemid")
+                val = lab.attr_dict.get("valuenum")
+                if item_raw is not None and val is not None:
+                    item_id = str(item_raw).split(".")[0]
+                    if item_id in ts_vals:
+                        try:
+                            ts_vals[item_id].append(float(val))
+                        except (ValueError, TypeError):
+                            pass
 
     # Collect vitals values from training stays
     if vitals_by_stay:
-        train_stay_ids: set[str] = set()
-        for patient in dataset.iter_patients():
-            if allowed_pids is not None and str(patient.patient_id) not in allowed_pids:
-                continue
-            for stay in patient.get_events("icustays"):
-                sid = str(stay.attr_dict.get("stay_id", ""))
-                if sid:
-                    train_stay_ids.add(sid)
-                    
         for vid in CORE_VITALS_MAP.keys():
-            if vid not in vals_by_item:
-                vals_by_item[vid] = []
+            if vid not in ts_vals:
+                ts_vals[vid] = []
             int_vid = int(vid)
             for sid in train_stay_ids:
                 for rec in vitals_by_stay.get(sid, []):
                     if rec["itemid"] == int_vid:
-                        vals_by_item[vid].append(float(rec["valuenum"]))
+                        ts_vals[vid].append(float(rec["valuenum"]))
 
-    stats: dict[str, tuple[float, float]] = {}
-    counts: dict[str, int] = {}
+    # 1. Empirical time-series normalization stats (mean, std)
+    ts_stats: dict[str, tuple[float, float]] = {}
+    ts_counts: dict[str, int] = {}
     all_keys = list(lab_item_ids) + ([k for k in CORE_VITALS_MAP.keys()] if vitals_by_stay else [])
     
     for item_id in all_keys:
-        vals = vals_by_item.get(item_id, [])
-        counts[item_id] = len(vals)
+        vals = ts_vals.get(item_id, [])
+        ts_counts[item_id] = len(vals)
         if len(vals) > 0:
             arr = np.array(vals)
             p1, p99 = np.percentile(arr, 1), np.percentile(arr, 99)
             clipped = np.clip(arr, p1, p99)
             mean = float(np.mean(clipped))
             std = float(np.std(clipped))
-            stats[item_id] = (mean, std if std > 1e-4 else 1.0)
+            ts_stats[item_id] = (mean, std if std > 1e-4 else 1.0)
         else:
-            stats[item_id] = (0.0, 1.0)
-            
-    return stats, counts
+            ts_stats[item_id] = (0.0, 1.0)
+
+    # 2. Empirical continuous static stats: (mean, std, median)
+    static_stats: dict[str, tuple[float, float, float]] = {}
+    default_priors = {
+        "age": (60.0, 15.0, 60.0),
+        "height": (170.0, 10.0, 170.0),
+        "weight": (80.0, 20.0, 80.0),
+        "eyes": (3.5, 0.8, 4.0),
+        "motor": (5.5, 1.0, 6.0),
+        "verbal": (4.5, 1.0, 5.0),
+    }
+    for k, prior in default_priors.items():
+        vals = continuous_static_vals.get(k, [])
+        if len(vals) > 0:
+            arr = np.array(vals)
+            mean = float(np.mean(arr))
+            std = float(np.std(arr))
+            median = float(np.median(arr))
+            static_stats[k] = (mean, std if std > 1e-4 else prior[1], median)
+        else:
+            static_stats[k] = prior
+
+    # 3. Deterministic sorted categorical vocabularies
+    cat_vocabs = {k: sorted(list(v)) for k, v in cat_sets.items()}
+    
+    return ts_stats, ts_counts, static_stats, cat_vocabs
 
 
 def generate_tpc_tensors(
@@ -260,20 +399,10 @@ def generate_tpc_tensors(
     - Forward-fills across missing hourly intervals.
     - Computes decay indicators: x''_t = 0.75^j, where j is hours since last recording.
     - If never observed, value is 0.0 (population mean) and decay indicator is 0.0.
-    
-    Args:
-        raw_grid: Standardized tensor of shape (seq_len, num_features).
-        mask: Binary tensor of shape (seq_len, num_features), 1 if measured at step t.
-        
-    Returns:
-        vitals_ff: Forward-filled tensor of shape (seq_len, num_features).
-        vitals_decay: Decay indicators tensor of shape (seq_len, num_features).
     """
     seq_len, num_features = raw_grid.shape
     vitals_ff = raw_grid.clone()
     vitals_decay = torch.zeros_like(raw_grid)
-    
-    # Vector of hours elapsed since last measurement
     time_since_last = torch.full((num_features,), float("inf"), dtype=torch.float32)
     
     for t in range(seq_len):
@@ -281,12 +410,10 @@ def generate_tpc_tensors(
         time_since_last[measured] = 0.0
         time_since_last[~measured] += 1.0
         
-        # Forward fill unmeasured values from previous hour
         if t > 0:
             unmeasured = ~measured
             vitals_ff[t, unmeasured] = vitals_ff[t - 1, unmeasured]
             
-        # Decay indicator: 0.75^j (0.0 if never observed)
         finite = ~torch.isinf(time_since_last)
         vitals_decay[t, finite] = torch.pow(0.75, time_since_last[finite])
         
@@ -303,10 +430,6 @@ class LengthOfStayTask(BaseTask):
     - Minimum ICU length of stay of 5 hours.
     - At least one recorded clinical observation during the stay.
     - Capped at first 14 days (336 hours).
-    - Multi-Modal Features:
-      • Dynamic Time-Series: Bedside vitals + dynamic laboratory tests.
-      • 12 Static (Flat) Features: Age, Gender, Admission Hour, Height, Weight,
-        GCS Eyes, GCS Motor, GCS Verbal, Care Unit, Admission Location, Insurance, Race.
     - Target: Remaining LoS in days anchored at the end of each hour t:
       y_t = max((out_time - (in_time + t + 1 hours)) / 24.0, 1/48 days).
     """
@@ -330,6 +453,8 @@ class LengthOfStayTask(BaseTask):
         norm_stats: dict[str, tuple[float, float]] | None = None,
         vitals_by_stay: dict[str, list[dict[str, Any]]] | None = None,
         baseline_static_by_stay: dict[str, dict[str, float]] | None = None,
+        static_stats: dict[str, tuple[float, float, float]] | None = None,
+        cat_vocabs: dict[str, list[str]] | None = None,
         max_stay_hours: int = 336,
     ):
         super(LengthOfStayTask, self).__init__()
@@ -339,13 +464,44 @@ class LengthOfStayTask(BaseTask):
         self.norm_stats = norm_stats or {}
         self.max_stay_hours = max_stay_hours
 
-        # Construct unified feature mapping
-        # 1. Vital signs (if chartevents cache provided)
+        # Construct time-series feature mapping
         self.vital_keys = list(CORE_VITALS_MAP.keys()) if self.vitals_by_stay else []
-        # 2. Dynamic lab tests
         self.all_feature_ids = self.vital_keys + self.lab_item_ids
         self.feature_map = {item_id: idx for idx, item_id in enumerate(self.all_feature_ids)}
-        self.num_features = len(self.all_feature_ids)
+        self.continuous_dim = len(self.all_feature_ids)
+        self.num_features = self.continuous_dim
+
+        # Static continuous feature priors (mean, std, median)
+        self.static_stats = static_stats or {
+            "age": (60.0, 15.0, 60.0),
+            "height": (170.0, 10.0, 170.0),
+            "weight": (80.0, 20.0, 80.0),
+            "eyes": (3.5, 0.8, 4.0),
+            "motor": (5.5, 1.0, 6.0),
+            "verbal": (4.5, 1.0, 5.0),
+        }
+
+        # Deterministic categorical vocabularies
+        self.cat_vocabs = cat_vocabs or {
+            "first_careunit": ["MICU", "SICU", "CCU", "CVICU", "TSICU"],
+            "admission_location": ["EMERGENCY ROOM", "TRANSFER FROM HOSPITAL", "PHYSICIAN REFERRAL"],
+            "insurance": ["Medicare", "Medicaid", "Other"],
+            "race": ["WHITE", "BLACK/AFRICAN AMERICAN", "HISPANIC/LATINO", "ASIAN"],
+        }
+        
+        # 11 continuous/indicator features + one-hot categories (each with unknown slot)
+        # Continuous (11): age, gender, adm_hour, height, missing_height, weight,
+        #                  missing_weight, eyes, motor, verbal, missing_gcs
+        self.static_dim = 11 + sum(len(vocab) + 1 for vocab in self.cat_vocabs.values())
+
+    @staticmethod
+    def _one_hot(val: str, vocab: list[str]) -> list[float]:
+        vec = [0.0] * (len(vocab) + 1)
+        if val in vocab:
+            vec[vocab.index(val)] = 1.0
+        else:
+            vec[-1] = 1.0  # Unknown slot
+        return vec
 
     def __call__(self, patient: Any) -> list[dict[str, Any]]:
         samples = []
@@ -362,14 +518,12 @@ class LengthOfStayTask(BaseTask):
         icustays = patient.get_events(event_type="icustays")
         admissions = patient.get_events(event_type="admissions")
         
-        # Pre-filter labevents for this patient once
         raw_labs = patient.get_events(event_type="labevents")
         patient_labs = [
             lab for lab in raw_labs
             if str(lab.attr_dict.get("itemid", "")).split(".")[0] in self.feature_map and lab.timestamp is not None
         ]
         
-        # Build map of admission mortality flags and demographics
         hadm_expire_map: dict[str, bool] = {}
         adm_meta_map: dict[str, dict[str, str]] = {}
         for adm in admissions:
@@ -401,7 +555,7 @@ class LengthOfStayTask(BaseTask):
             stay_id_str = str(icustay.attr_dict.get("stay_id", ""))
             hadm_id = str(icustay.attr_dict.get("hadm_id", ""))
             
-            # True age at admission (Section 4.2: intime.year - anchor_year + anchor_age)
+            # True age at admission (Section 4.2)
             true_age = float(in_time.year - anchor_year + anchor_age)
             if true_age <= 18:
                 continue
@@ -418,11 +572,10 @@ class LengthOfStayTask(BaseTask):
             if T <= 0:
                 continue
                 
-            # Initialize 2D grid for time-series features
             raw_grid = torch.zeros((T, self.num_features), dtype=torch.float32)
             mask = torch.zeros((T, self.num_features), dtype=torch.float32)
             
-            # 1. Fill bedside vital signs from chartevents (if cached)
+            # 1. Bedside vital signs from chartevents (if provided)
             if self.vitals_by_stay and stay_id_str in self.vitals_by_stay:
                 for rec in self.vitals_by_stay[stay_id_str]:
                     v_time = rec["charttime"]
@@ -434,11 +587,10 @@ class LengthOfStayTask(BaseTask):
                     if 0 <= hour < T:
                         val = float(rec["valuenum"])
                         mean, std = self.norm_stats.get(item_id, (0.0, 1.0))
-                        norm_val = (val - mean) / (std if std > 1e-4 else 1.0)
-                        raw_grid[hour, f_idx] = norm_val
+                        raw_grid[hour, f_idx] = (val - mean) / (std if std > 1e-4 else 1.0)
                         mask[hour, f_idx] = 1.0
 
-            # 2. Fill laboratory tests from labevents
+            # 2. Laboratory tests from labevents
             for lab in patient_labs:
                 lab_time = lab.timestamp
                 item_raw = lab.attr_dict.get("itemid")
@@ -452,8 +604,7 @@ class LengthOfStayTask(BaseTask):
                             try:
                                 val = float(val_raw)
                                 mean, std = self.norm_stats.get(item_id, (0.0, 1.0))
-                                norm_val = (val - mean) / (std if std > 1e-4 else 1.0)
-                                raw_grid[hour, f_idx] = norm_val
+                                raw_grid[hour, f_idx] = (val - mean) / (std if std > 1e-4 else 1.0)
                                 mask[hour, f_idx] = 1.0
                             except (ValueError, TypeError):
                                 pass
@@ -462,52 +613,84 @@ class LengthOfStayTask(BaseTask):
             if mask.sum() == 0:
                 continue
                 
-            # 3. Apply forward filling and compute decay indicators: 0.75^j
+            # 3. Forward filling & exponential decay indicators: 0.75^j
             vitals_ff, vitals_decay = generate_tpc_tensors(raw_grid, mask)
             
-            # 4. Hourly Remaining LoS Target (anchored at end of hour t with floor matching prediction)
+            # 4. Hourly Remaining LoS Target anchored at end of hour t
             los_targets = torch.tensor(
                 [
                     max((out_time - (in_time + timedelta(hours=t + 1))).total_seconds() / 86400.0, LOS_FLOOR_DAYS)
                     for t in range(T)
                 ],
                 dtype=torch.float32,
-            ).unsqueeze(1)  # Shape (T, 1)
+            ).unsqueeze(1)
             
             # 5. In-Hospital Mortality Label
             mort_val = 1.0 if hadm_expire_map.get(hadm_id, False) else 0.0
             
-            # 6. Extract 12 Static (Flat) Features matching Section 4.2 / Table 6
+            # 6. Static Features (Continuous standardized + Missingness flags + One-Hot Categoricals)
             base_s = self.baseline_static_by_stay.get(stay_id_str, {})
             adm_m = adm_meta_map.get(hadm_id, {})
             
-            age_norm = (true_age - 60.0) / 20.0
+            # Continuous standardized with train split parameters and median imputation
+            age_m, age_s, _ = self.static_stats["age"]
+            age_norm = (true_age - age_m) / age_s
             adm_hour_norm = (float(in_time.hour) - 12.0) / 12.0
-            height_norm = (base_s.get("height", 170.0) - 170.0) / 15.0
-            weight_norm = (base_s.get("weight", 80.0) - 80.0) / 20.0
-            eyes_norm = (base_s.get("eyes", 4.0) - 2.5) / 1.5
-            motor_norm = (base_s.get("motor", 6.0) - 3.5) / 2.5
-            verbal_norm = (base_s.get("verbal", 5.0) - 3.0) / 2.0
-            careunit_norm = (float(hash(icustay.attr_dict.get("first_careunit", "")) % 10) - 4.5) / 4.5
-            adm_loc_norm = (float(hash(adm_m.get("admission_location", "")) % 10) - 4.5) / 4.5
-            ins_norm = (float(hash(adm_m.get("insurance", "")) % 10) - 4.5) / 4.5
-            race_norm = (float(hash(adm_m.get("race", "")) % 10) - 4.5) / 4.5
+            
+            # Height
+            h_m, h_s, h_med = self.static_stats["height"]
+            if "height" in base_s:
+                height_norm = (base_s["height"] - h_m) / h_s
+                missing_height = 0.0
+            else:
+                height_norm = (h_med - h_m) / h_s
+                missing_height = 1.0
+                
+            # Weight
+            w_m, w_s, w_med = self.static_stats["weight"]
+            if "weight" in base_s:
+                weight_norm = (base_s["weight"] - w_m) / w_s
+                missing_weight = 0.0
+            else:
+                weight_norm = (w_med - w_m) / w_s
+                missing_weight = 1.0
+                
+            # GCS (Eyes, Motor, Verbal)
+            e_m, e_s, e_med = self.static_stats["eyes"]
+            m_m, m_s, m_med = self.static_stats["motor"]
+            v_m, v_s, v_med = self.static_stats["verbal"]
+            if "eyes" in base_s and "motor" in base_s and "verbal" in base_s:
+                eyes_norm = (base_s["eyes"] - e_m) / e_s
+                motor_norm = (base_s["motor"] - m_m) / m_s
+                verbal_norm = (base_s["verbal"] - v_m) / v_s
+                missing_gcs = 0.0
+            else:
+                eyes_norm = (e_med - e_m) / e_s
+                motor_norm = (m_med - m_m) / m_s
+                verbal_norm = (v_med - v_m) / v_s
+                missing_gcs = 1.0
 
-            static_tensor = torch.tensor([
+            # One-hot encoded categoricals with dedicated unknown slot
+            careunit_oh = self._one_hot(str(icustay.attr_dict.get("first_careunit", "")), self.cat_vocabs["first_careunit"])
+            adm_loc_oh = self._one_hot(adm_m.get("admission_location", ""), self.cat_vocabs["admission_location"])
+            ins_oh = self._one_hot(adm_m.get("insurance", ""), self.cat_vocabs["insurance"])
+            race_oh = self._one_hot(adm_m.get("race", ""), self.cat_vocabs["race"])
+
+            static_list = [
                 age_norm,
                 gender_val,
                 adm_hour_norm,
                 height_norm,
+                missing_height,
                 weight_norm,
+                missing_weight,
                 eyes_norm,
                 motor_norm,
                 verbal_norm,
-                careunit_norm,
-                adm_loc_norm,
-                ins_norm,
-                race_norm,
-            ], dtype=torch.float32)
-            
+                missing_gcs,
+            ] + careunit_oh + adm_loc_oh + ins_oh + race_oh
+
+            static_tensor = torch.tensor(static_list, dtype=torch.float32)
             stay_mask = torch.ones(T, dtype=torch.bool)
             
             sample = {
@@ -541,8 +724,8 @@ class BucketBatchSampler(Sampler[list[int]]):
     """Batches sequences of similar length together to minimize zero padding overhead.
     
     Partitions stays into length-sorted buckets and shuffles batch execution order
-    every epoch. This eliminates the systematic shortest-to-longest training bias
-    while retaining the memory and computation benefits of length bucketing.
+    every epoch. Allows resetting epoch counter to ensure strictly unconfounded
+    ablation comparisons across model configurations.
     """
     def __init__(
         self,
@@ -555,6 +738,10 @@ class BucketBatchSampler(Sampler[list[int]]):
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.seed = seed
+        self.epoch = 0
+
+    def reset(self) -> None:
+        """Resets the epoch counter so all ablation configurations see the exact same batch orders."""
         self.epoch = 0
 
     def __iter__(self) -> Iterator[list[int]]:
@@ -578,24 +765,25 @@ def run_ablation_study(
     train_loader: DataLoader,
     val_loader: DataLoader,
     test_loader: DataLoader,
+    train_sampler: BucketBatchSampler,
     continuous_dim: int,
-    static_dim: int = 12,
+    static_dim: int,
+    seed: int = 42,
 ):
-    """Runs the architectural ablation study reproducing Table 3 from Rocheteau et al.
+    """Runs the architectural ablation study replicating the paper's ablation methodology.
     
     Ablations Evaluated:
-    1. TPC (Proposed: MSLE Loss, Exponential Decay, Multi-Modal Inputs)
-    2. TPC without Decay (Ablates missing data decay channels: use_decay=False)
-    3. TPC with MSE Loss (Ablates MSLE loss: loss_fn='mse')
+    1. TPC (Proposed): MSLE Loss, Exponential Decay, Multi-Modal Inputs
+    2. TPC (No Decay): Ablates missing data decay channels (use_decay=False)
+    3. TPC (MSE Loss): Ablates logarithmic MSLE loss in favor of standard MSE loss
     
-    Evaluates:
-    - Val MSLE: Used for early stopping / model selection
-    - Test MSLE: Mean Squared Logarithmic Error (Primary paper metric)
-    - Test MSE: Mean Squared Error in days^2
-    - Test MAE: Mean Absolute Error in days (MAD in paper)
+    Experimental Control:
+    - Shared random seed ensures identical initial parameter weights across all configs.
+    - Sampler reset ensures identical mini-batch sequences across all configs.
+    - Fixed 2-epoch training is used here for rapid demonstration and automated testing.
     """
     print("\n" + "=" * 85)
-    print("DEMO ABLATION STUDY: MULTI-MODAL TPC PIPELINE VERIFICATION")
+    print("HELD-OUT TEST ABLATION STUDY: MULTI-MODAL TPC PIPELINE VERIFICATION")
     print(f"Features: {continuous_dim} Continuous Time-Series + {static_dim} Static Features")
     print("=" * 85)
     
@@ -654,10 +842,15 @@ def run_ablation_study(
 
     results = []
     
-    for seed_idx, cfg in enumerate(configs):
+    for cfg in configs:
         print(f"\nTraining configuration: {cfg['name']}...")
-        torch.manual_seed(42 + seed_idx)
-        np.random.seed(42 + seed_idx)
+        
+        # Reset sampler epoch so each configuration sees the exact same batch ordering
+        train_sampler.reset()
+        
+        # Reset seeds so shared parameters initialize identically
+        torch.manual_seed(seed)
+        np.random.seed(seed)
         
         model = TPC(
             dataset=None,
@@ -675,7 +868,6 @@ def run_ablation_study(
         )
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         
-        # Train for 2 epochs
         model.train()
         for _ in range(2):
             for batch in train_loader:
@@ -684,7 +876,6 @@ def run_ablation_study(
                 out["loss"].backward()
                 optimizer.step()
                 
-        # Evaluate on validation loader and held-out test loader
         val_msle, _, _ = evaluate_loader(model, val_loader)
         test_msle, test_mse, test_mae = evaluate_loader(model, test_loader)
         
@@ -697,7 +888,7 @@ def run_ablation_study(
         })
         
     print("\n" + "=" * 85)
-    print("HELD-OUT TEST ABLATION STUDY RESULTS (Corresponds to Table 3 in Rocheteau et al.):")
+    print("HELD-OUT TEST ABLATION STUDY RESULTS (MIMIC-IV Demo Cohort, Table 3 Protocol):")
     print(f"{'Configuration':<32} | {'Val MSLE':<10} | {'Test MSLE':<10} | {'Test MSE':<10} | {'Test MAE':<10}")
     print("-" * 85)
     for r in results:
@@ -730,16 +921,24 @@ if __name__ == "__main__":
         test_pids = set(perm_pids[n_train + n_val :])
         print(f"  Train patients: {len(train_pids)}, Val patients: {len(val_pids)}, Test patients: {len(test_pids)}")
         
-        print("\n3. Loading bedside vital signs & baseline static items from chartevents...")
-        vitals_by_stay, baseline_static_by_stay = load_chartevents_cache(mimic4_root)
-        print(f"  Loaded vitals for {len(vitals_by_stay)} stays, baseline static for {len(baseline_static_by_stay)} stays.")
+        print("\n3. Loading bedside vital signs & admission baseline items from chartevents...")
+        print("  (Note: Adapter for demo data; chartevents is omitted from default PyHealth YAML due to full 35GB size)")
+        vitals_by_stay, baseline_static_by_stay = load_chartevents_cache(mimic4_root, dataset)
+        print(f"  Loaded vitals for {len(vitals_by_stay)} stays, baseline items for {len(baseline_static_by_stay)} stays.")
 
-        print("\n4. Dynamically selecting laboratory tests (Paper inclusion rule on training split)...")
-        qualifying_labs = select_qualifying_labs(dataset, train_pids, min_prevalence=0.25, min_avg_obs=3.0, max_labs=45)
-        print(f"  Selected {len(qualifying_labs)} qualifying lab tests meeting >=25% stay prevalence & >3 obs/stay.")
+        print("\n4. Dynamically selecting laboratory tests (Paper inclusion rule on training stays)...")
+        qualifying_labs, thresh_met = select_qualifying_labs(
+            dataset, train_pids, min_prevalence=0.25, min_avg_obs=3.0, max_labs=45
+        )
+        if thresh_met:
+            print(f"  Selected {len(qualifying_labs)} qualifying lab tests meeting >=25% stay prevalence & >3 obs/stay.")
+        else:
+            print(f"  Notice: Small cohort fallback used; selected {len(qualifying_labs)} default clinical labs.")
 
-        print("\n5. Computing empirical training statistics (strictly on train split, 1st/99th percentile clipping)...")
-        emp_stats, feat_counts = compute_empirical_stats(dataset, train_pids, qualifying_labs, vitals_by_stay)
+        print("\n5. Computing empirical training statistics & vocabularies (strictly on train split)...")
+        emp_stats, feat_counts, static_stats, cat_vocabs = compute_empirical_training_stats(
+            dataset, train_pids, qualifying_labs, vitals_by_stay, baseline_static_by_stay
+        )
         total_ts_features = len(CORE_VITALS_MAP) + len(qualifying_labs)
         print(f"  Computed normalization parameters across {total_ts_features} time-series features.")
         print(f"  Core Vital Signs ({len(CORE_VITALS_MAP)}):")
@@ -748,13 +947,16 @@ if __name__ == "__main__":
             cnt = feat_counts.get(vid, 0)
             print(f"    {vname} ({vid}): {cnt:5d} measurements, mean={mean:7.2f}, std={std:6.2f}")
             
-        print("\n6. Applying ICU Length of Stay Task (Multi-Modal Time Series + 12 Static Features)...")
+        print("\n6. Applying ICU Length of Stay Task (Multi-Modal Time Series + Static Features)...")
         task = LengthOfStayTask(
             lab_item_ids=qualifying_labs,
             norm_stats=emp_stats,
             vitals_by_stay=vitals_by_stay,
             baseline_static_by_stay=baseline_static_by_stay,
+            static_stats=static_stats,
+            cat_vocabs=cat_vocabs,
         )
+        print(f"  Derived static feature dimension: {task.static_dim}")
         sample_dataset = dataset.set_task(task)
         print(f"Total valid ICU stays created: {len(sample_dataset)}")
         
@@ -765,19 +967,17 @@ if __name__ == "__main__":
             print(f"  Visit/Stay ID: {sample0['visit_id']}")
             print(f"  Vitals shape (T x F): {sample0['vitals'].shape}")
             print(f"  Vitals decay shape (T x F): {sample0['vitals_decay'].shape}")
-            print(f"  Static features shape (12,): {sample0['static'].shape}")
+            print(f"  Static features shape: {sample0['static'].shape}")
             print(f"  Mask shape: {sample0['mask'].shape}")
             print(f"  Hourly remaining LoS shape: {sample0['los'].shape}")
             print(f"  Remaining LoS at hour 0: {sample0['los'][0].item():.2f} days")
             print(f"  Remaining LoS at final hour: {sample0['los'][-1].item():.2f} days")
             
-            # Check mortality prevalence across the cohort
             mort_count = sum(s["mortality"].item() for s in sample_dataset)
             mort_rate = mort_count / len(sample_dataset) * 100.0
             print(f"  Cohort In-Hospital Mortality Prevalence: {mort_count:.0f}/{len(sample_dataset)} ({mort_rate:.1f}%)")
             assert mort_count > 0, "Mortality extraction yielded 0 positive cases!"
             
-            # Build patient subsets using patient_to_index to avoid data leakage
             p2idx = sample_dataset.patient_to_index
             train_indices = list(chain(*[p2idx[pid] for pid in train_pids if pid in p2idx]))
             val_indices = list(chain(*[p2idx[pid] for pid in val_pids if pid in p2idx]))
@@ -788,7 +988,6 @@ if __name__ == "__main__":
             test_samples = [sample_dataset[i] for i in test_indices]
             print(f"  Train stays: {len(train_samples)}, Val stays: {len(val_samples)}, Test stays: {len(test_samples)}")
             
-            # Length bucketing sampler shuffles batch order every epoch while keeping stays of similar length together
             train_lengths = [s["vitals"].shape[0] for s in train_samples]
             train_sampler = BucketBatchSampler(train_lengths, batch_size=4, shuffle=True, seed=42)
             train_loader = DataLoader(
@@ -809,15 +1008,16 @@ if __name__ == "__main__":
                 collate_fn=collate_fn_dict_with_padding,
             )
             
-            # Run the ablation experiment with held-out test evaluation
             run_ablation_study(
                 train_loader,
                 val_loader,
                 test_loader,
-                continuous_dim=task.num_features,
-                static_dim=12,
+                train_sampler=train_sampler,
+                continuous_dim=task.continuous_dim,
+                static_dim=task.static_dim,
+                seed=42,
             )
             
-            print("\nEnd-to-end TPC pipeline & ablation successfully completed!")
+            print("\nEnd-to-end TPC pipeline & unconfounded ablation successfully completed!")
         else:
             print("No valid ICU samples generated.")
