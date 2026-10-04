@@ -41,7 +41,15 @@ Implementation Notes & Methodological Alignment:
 6. Length-Bucketed Batch Sampling & Unconfounded Ablation:
    - Groups stays of similar length to minimize padding overhead.
    - Resets epoch counters and shares identical random seeds across configurations,
-     ensuring strictly identical batch sequences and weight initializations.
+     ensuring the same random seed and batch order across configs (initial weights
+     are identical only for configs with the same architecture).
+7. Known Limitations & Caching:
+   - BatchNorm over padded timesteps: 1D Batch Normalization in TPC blocks computes
+     statistics across all steps including padding. Length-bucketed batch sampling
+     greatly reduces padding overhead but does not completely eliminate it in uneven batches.
+   - Cache key invalidation: PyHealth's BaseDataset.set_task hashes vars(task) via uuid5,
+     so changes to norm_stats, static_stats, cat_vocabs, or vitals dicts automatically
+     generate a new cache directory. Users can also call dataset.clean_tmpdir() to clear.
 """
 
 from collections.abc import Iterator
@@ -57,8 +65,8 @@ from pyhealth.datasets import MIMIC4Dataset, collate_fn_dict_with_padding
 from pyhealth.tasks import BaseTask
 from pyhealth.models.tpc import TPC
 
-# 7 Core Bedside Vital Signs from chartevents
-# (Derived from EmmaRocheteau/TPC-LoS-prediction/MIMIC_preprocessing/timeseries.sql)
+# 7 hand-selected core vitals from chartevents (Rocheteau et al. dynamically
+# filtered chartevents by >=25% stay prevalence & >5 obs/stay, then hand-trimmed)
 CORE_VITALS_MAP = {
     "220045": "Heart Rate",
     "220179": "NIBP Systolic",
@@ -70,7 +78,7 @@ CORE_VITALS_MAP = {
 }
 
 # Baseline clinical assessments extracted within admission window [-24h, +5h]
-# (Derived from EmmaRocheteau/TPC-LoS-prediction/MIMIC_preprocessing/flat_features.sql)
+# adapted from flat_features.sql (true elapsed-time window)
 BASELINE_STATIC_ITEMS = {
     226512: "weight",
     226730: "height",
@@ -112,6 +120,14 @@ def select_qualifying_labs(
     Counts measurements strictly within each ICU stay window [in_time, min(out_time, in_time + 14d)).
     Cohort filters (adults > 18, stays >= 5 hours) match the task definition exactly.
     
+    Args:
+        dataset: MIMIC4Dataset instance.
+        train_pids: Patient IDs belonging to the training split.
+        min_prevalence: Minimum stay prevalence threshold (default: 0.25).
+        min_avg_obs: Minimum average observations per stay (default: 3.0).
+        max_labs: Cap on number of qualifying labs (defaults to 45, which
+            corresponds to the number of qualifying lab tests produced on the paper's cohort).
+            
     Returns:
         selected_labs: List of item IDs.
         threshold_met: True if selected via statistical thresholds, False if fallback was used.
@@ -194,7 +210,7 @@ def load_chartevents_cache(
 ) -> tuple[dict[str, list[tuple[int, str, float]]], dict[str, dict[str, float]]]:
     """Loads bedside vital signs and admission-window baseline measurements from chartevents.
     
-    Adheres to Rocheteau et al. (flat_features.sql & timeseries.sql):
+    Adheres to Rocheteau et al. (adapted from flat_features.sql with true elapsed-time window):
     - Vital signs are sorted chronologically by charttime so "last value in the hour wins"
       strictly follows temporal order rather than file order.
     - Continuous vitals are returned as lightweight (hour, item_id, val) primitive tuples
@@ -838,7 +854,7 @@ def run_ablation_study(
     3. TPC (MSE Loss): Ablates logarithmic MSLE loss in favor of standard MSE loss
     
     Experimental Control:
-    - Shared random seed ensures identical initial parameter weights across all configs.
+    - Same random seed and batch order across configs (initial weights are identical only for configs with the same architecture).
     - Sampler reset ensures identical mini-batch sequences across all configs.
     - Fixed 2-epoch training is used here for rapid demonstration and automated testing.
     """
@@ -908,7 +924,7 @@ def run_ablation_study(
         # Reset sampler epoch so each configuration sees the exact same batch ordering
         train_sampler.reset()
         
-        # Reset seeds so shared parameters initialize identically
+        # Reset seeds for reproducible parameter initialization
         torch.manual_seed(seed)
         np.random.seed(seed)
         
@@ -948,7 +964,7 @@ def run_ablation_study(
         })
         
     print("\n" + "=" * 85)
-    print("HELD-OUT TEST ABLATION STUDY RESULTS (MIMIC-IV Demo Cohort, Table 3 Protocol):")
+    print("HELD-OUT TEST ABLATION STUDY RESULTS (MIMIC-IV demo, 2 epochs – pipeline check only):")
     print(f"{'Configuration':<32} | {'Val MSLE':<10} | {'Test MSLE':<10} | {'Test MSE':<10} | {'Test MAE':<10}")
     print("-" * 85)
     for r in results:
@@ -982,7 +998,7 @@ if __name__ == "__main__":
         print(f"  Train patients: {len(train_pids)}, Val patients: {len(val_pids)}, Test patients: {len(test_pids)}")
         
         print("\n3. Loading bedside vital signs & admission baseline items from chartevents...")
-        print("  (Note: Adapter for demo data; chartevents is omitted from default PyHealth YAML due to full 35GB size)")
+        print("  (Note: Adapter for demo data; chartevents is large; this adapter reads the demo file directly)")
         vitals_by_stay, baseline_static_by_stay = load_chartevents_cache(mimic4_root, dataset)
         print(f"  Loaded vitals for {len(vitals_by_stay)} stays, baseline items for {len(baseline_static_by_stay)} stays.")
 

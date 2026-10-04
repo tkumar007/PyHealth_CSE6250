@@ -19,6 +19,17 @@ class TPCBlock(nn.Module):
         static_dim (int): Number of static features (S).
         kernel_size (int): Filter size (k).
         dropout (float): Dropout probability.
+
+    Examples:
+        >>> import torch
+        >>> from pyhealth.models.tpc import TPCBlock
+        >>> block = TPCBlock(layer_idx=1, num_features=12, point_dim=16, temp_dim=8, static_dim=5)
+        >>> vitals = torch.randn(2, 24, 12)
+        >>> vitals_decay = torch.rand(2, 24, 12)
+        >>> static = torch.randn(2, 5)
+        >>> out = block(vitals, vitals_decay=vitals_decay, static=static)
+        >>> out.shape
+        torch.Size([2, 24, 28])
     """
     def __init__(
         self,
@@ -156,6 +167,27 @@ class TPC(BaseModel):
             for the paper's 'No Decay' ablation variant. Default: True.
         multitask (bool): Whether to predict both LoS and in-hospital mortality. Default: False.
         alpha (float): Weighting for mortality loss in multitask mode. Default: 0.5.
+
+    Note on Batch Normalization over Padded Steps:
+        TPC utilizes 1D Batch Normalization (BatchNorm1d) across feature channels.
+        In mini-batches containing padded sequence lengths, BatchNorm computes running
+        mean and variance across all time steps including padded zeros. While length-bucketed
+        batching (e.g., BucketBatchSampler) minimizes padding overhead, uneven batches
+        may still include zero-padded steps in the batch statistics calculation.
+
+    Examples:
+        >>> import torch
+        >>> from pyhealth.models.tpc import TPC
+        >>> model = TPC(dataset=None, continuous_dim=12, static_dim=5)
+        >>> vitals = torch.randn(2, 24, 12)
+        >>> vitals_decay = torch.rand(2, 24, 12)
+        >>> static = torch.randn(2, 5)
+        >>> y_true = torch.rand(2, 24, 1) + 0.1
+        >>> out = model(vitals=vitals, vitals_decay=vitals_decay, static=static, y_true=y_true)
+        >>> out["y_prob"].shape
+        torch.Size([2, 24, 1])
+        >>> "loss" in out
+        True
     """
     def __init__(
         self,

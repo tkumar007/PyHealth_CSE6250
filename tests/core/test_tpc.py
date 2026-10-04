@@ -11,7 +11,14 @@ if repo_root not in sys.path:
 
 from pyhealth.models.tpc import TPC
 from pyhealth.datasets import collate_fn_dict_with_padding
-from examples.mimic4_los_tpc import generate_tpc_tensors, LengthOfStayTask
+from examples.mimic4_los_tpc import (
+    DEFAULT_LAB_ITEMS,
+    BucketBatchSampler,
+    LengthOfStayTask,
+    generate_tpc_tensors,
+    load_chartevents_cache,
+    select_qualifying_labs,
+)
 
 
 class MockDataset:
@@ -352,3 +359,209 @@ def test_tpc_no_decay_ablation():
     out = model(vitals=vitals, y_true=y_true, mask=mask)
     assert out["y_prob"].shape == (batch_size, seq_len, 1)
     assert not torch.isnan(out["loss"])
+
+
+def test_static_features_deterministic_and_one_hot():
+    """Tests that static feature extraction is deterministic, known categories land in assigned slots, and blocks sum to 1."""
+    patient = MockPatient(patient_id="p1", anchor_age=65, anchor_year=2020, stay_hours=24)
+    patient.events["admissions"][0].attr_dict.update({
+        "admission_location": "EMERGENCY ROOM",
+        "insurance": "Medicare",
+        "race": "WHITE",
+    })
+    patient.events["icustays"][0].attr_dict["first_careunit"] = "MICU"
+    
+    task = LengthOfStayTask()
+    
+    # 1. Deterministic across two task calls
+    res1 = task(patient)
+    res2 = task(patient)
+    assert len(res1) == 1 and len(res2) == 1
+    static1 = res1[0]["static"]
+    static2 = res2[0]["static"]
+    assert torch.equal(static1, static2)
+    assert static1.shape[0] == task.static_dim
+    
+    # 2. Verify known category lands in its exact assigned slot and unknown slot stays 0.0
+    known_cats = {
+        "first_careunit": "MICU",
+        "admission_location": "EMERGENCY ROOM",
+        "insurance": "Medicare",
+        "race": "WHITE",
+    }
+    offset = 11  # continuous & indicator features come first
+    for cat_name, vocab in task.cat_vocabs.items():
+        block_len = len(vocab) + 1  # includes unknown slot
+        block = static1[offset : offset + block_len]
+        assert block.sum().item() == pytest.approx(1.0)
+        assert ((block == 0.0) | (block == 1.0)).all()
+        val = known_cats[cat_name]
+        assert static1[offset + vocab.index(val)].item() == 1.0
+        assert static1[offset + len(vocab)].item() == 0.0  # unknown slot stays 0
+        offset += block_len
+    assert offset == task.static_dim
+
+    # 3. Test unknown category handling sets the unknown slot and leaves known slots 0.0
+    patient_unk = MockPatient(patient_id="p_unk", anchor_age=65, anchor_year=2020, stay_hours=24)
+    patient_unk.events["admissions"][0].attr_dict.update({
+        "admission_location": "UNSEEN_LOCATION",
+        "insurance": "UNSEEN_INSURANCE",
+        "race": "UNSEEN_RACE",
+    })
+    patient_unk.events["icustays"][0].attr_dict["first_careunit"] = "UNSEEN_CAREUNIT"
+    res_unk = task(patient_unk)
+    static_unk = res_unk[0]["static"]
+    
+    offset = 11
+    for cat_name, vocab in task.cat_vocabs.items():
+        block_len = len(vocab) + 1
+        block = static_unk[offset : offset + block_len]
+        assert block.sum().item() == pytest.approx(1.0)
+        assert block[-1].item() == 1.0  # unknown slot set
+        assert (block[:-1] == 0.0).all()  # all known slots stay 0
+        offset += block_len
+
+
+def test_baseline_values_outside_window_ignored(tmp_path):
+    """Tests that baseline chartevents outside [-24h, +5h] of admission are ignored."""
+    import gzip
+    
+    in_time = datetime(2020, 5, 1, 10, 0, 0)
+    
+    mock_dataset = type("MockDS", (), {
+        "iter_patients": lambda self: [
+            type("Patient", (), {
+                "get_events": lambda self, ev_type: [
+                    type("Stay", (), {
+                        "timestamp": in_time,
+                        "attr_dict": {"stay_id": "stay_100"}
+                    })()
+                ] if ev_type == "icustays" else []
+            })()
+        ]
+    })()
+    
+    # 1. -26h before admission -> outside window, ignored
+    # 2. -2h before admission -> inside window, weight = 75.0
+    # 3. +1h after admission -> inside window and closer to intime, weight = 76.0
+    # 4. +6h after admission -> outside window, ignored
+    # 5. height at +6h -> outside window, ignored completely
+    icu_dir = tmp_path / "icu"
+    icu_dir.mkdir(parents=True)
+    chart_file = icu_dir / "chartevents.csv.gz"
+    
+    csv_content = (
+        "stay_id,charttime,itemid,valuenum\n"
+        "stay_100,2020-04-30 08:00:00,226512,70.0\n"
+        "stay_100,2020-05-01 08:00:00,226512,75.0\n"
+        "stay_100,2020-05-01 11:00:00,226512,76.0\n"
+        "stay_100,2020-05-01 16:00:00,226512,85.0\n"
+        "stay_100,2020-05-01 16:00:00,226730,175.0\n"
+    )
+    with gzip.open(chart_file, "wt") as f:
+        f.write(csv_content)
+        
+    _, baseline_static_by_stay = load_chartevents_cache(str(tmp_path), mock_dataset)
+    
+    assert "stay_100" in baseline_static_by_stay
+    base = baseline_static_by_stay["stay_100"]
+    # Weight at +1h should be selected (closest to admission intime within [-24h, +5h])
+    assert "weight" in base
+    assert base["weight"] == 76.0
+    # Height was only recorded at +6h (outside [-24h, +5h]), so it must be ignored
+    assert "height" not in base
+
+
+def test_select_qualifying_labs_respects_stay_window():
+    """Tests that select_qualifying_labs counts labs strictly within the ICU stay window."""
+    in_time = datetime(2020, 5, 1, 10, 0, 0)
+    p = MockPatient(
+        patient_id="p_labs", anchor_age=40, anchor_year=2020, stay_hours=48, has_lab=False
+    )
+
+    def ev(item, hours):
+        return type(
+            "Event",
+            (),
+            {
+                "timestamp": in_time + timedelta(hours=hours),
+                "attr_dict": {"itemid": item, "valuenum": "1.0"},
+            },
+        )()
+
+    labs = []
+    for item in ["A1", "A2", "A3", "A4", "A5"]:  # 4 in-window obs each -> qualify
+        labs += [ev(item, h) for h in (1, 5, 10, 20)]
+    labs += [ev("X", 10)]                         # 1 in-window obs
+    labs += [ev("X", -h) for h in range(1, 6)]    # 5 before admission
+    labs += [ev("X", 49 + h) for h in range(5)]   # 5 after discharge
+    p.events["labevents"] = labs
+
+    ds = type("MockDS", (), {"iter_patients": lambda self: [p]})()
+    selected, met = select_qualifying_labs(
+        ds,
+        train_pids={"p_labs"},
+        min_prevalence=0.25,
+        min_avg_obs=3.0,
+        max_labs=45,
+    )
+    assert met is True
+    assert set(selected) == {"A1", "A2", "A3", "A4", "A5"}
+    assert "X" not in selected  # would qualify (11 obs) if the stay window were ignored
+
+
+def test_select_qualifying_labs_fallback():
+    """Tests that select_qualifying_labs triggers fallback when criteria are not met."""
+    in_time = datetime(2020, 5, 1, 10, 0, 0)
+    p = MockPatient(
+        patient_id="p_fallback", anchor_age=40, anchor_year=2020, stay_hours=48, has_lab=False
+    )
+    p.events["labevents"] = [
+        type(
+            "Event",
+            (),
+            {
+                "timestamp": in_time + timedelta(hours=10),
+                "attr_dict": {"itemid": "50902", "valuenum": "101"},
+            },
+        )()
+    ]
+
+    mock_dataset = type("MockDS", (), {"iter_patients": lambda self: [p]})()
+
+    # 1 observation is below the min_avg_obs=3.0 threshold, triggering fallback
+    selected, threshold_met = select_qualifying_labs(
+        mock_dataset,
+        train_pids={"p_fallback"},
+        min_prevalence=0.25,
+        min_avg_obs=3.0,
+        max_labs=45,
+    )
+    assert threshold_met is False
+    assert selected == DEFAULT_LAB_ITEMS
+
+
+def test_bucket_batch_sampler():
+    """Tests that BucketBatchSampler yields each index once per epoch and replays identically after reset()."""
+    lengths = [12, 14, 15, 20, 22, 25, 48, 50, 52, 100, 105, 110]
+    batch_size = 3
+    sampler = BucketBatchSampler(lengths, batch_size=batch_size, shuffle=True, seed=123)
+    
+    # 1. Epoch 0: All indices yielded exactly once
+    batches_ep0 = list(sampler)
+    all_indices_ep0 = [idx for batch in batches_ep0 for idx in batch]
+    assert sorted(all_indices_ep0) == list(range(len(lengths)))
+    assert len(batches_ep0) == 4
+    for b in batches_ep0:
+        assert len(b) == batch_size
+        
+    # 2. Epoch 1: Yields all indices, but shuffled batch order across epochs
+    batches_ep1 = list(sampler)
+    all_indices_ep1 = [idx for batch in batches_ep1 for idx in batch]
+    assert sorted(all_indices_ep1) == list(range(len(lengths)))
+    assert batches_ep0 != batches_ep1
+    
+    # 3. Reset: Replays epoch 0 sequence identically
+    sampler.reset()
+    batches_ep0_replay = list(sampler)
+    assert batches_ep0_replay == batches_ep0
