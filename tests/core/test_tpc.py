@@ -1,24 +1,24 @@
-import sys
 from pathlib import Path
-from datetime import datetime, timedelta
-import torch
+import sys
+
 import pytest
+import torch
 
 # Ensure repository root is on sys.path regardless of execution directory
 repo_root = str(Path(__file__).resolve().parents[2])
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
-from pyhealth.models.tpc import TPC
-from pyhealth.datasets import collate_fn_dict_with_padding
-from examples.mimic4_los_tpc import (
-    DEFAULT_LAB_ITEMS,
+from examples.eicu_los_tpc import (
+    DEFAULT_LAB_NAMES,
     BucketBatchSampler,
     LengthOfStayTask,
     generate_tpc_tensors,
-    load_chartevents_cache,
+    load_eicu_vitals_cache,
     select_qualifying_labs,
 )
+from pyhealth.datasets import collate_fn_dict_with_padding
+from pyhealth.models.tpc import TPC
 
 
 class MockDataset:
@@ -41,52 +41,51 @@ class MockDataset:
 
 
 class MockPatient:
-    """Minimal mock patient for unit testing LengthOfStayTask logic."""
-    def __init__(self, patient_id="p0", anchor_age=50, anchor_year=2020, stay_hours=24, has_lab=True):
+    """Minimal mock patient for unit testing eICU LengthOfStayTask logic."""
+    def __init__(
+        self,
+        patient_id: str = "p0",
+        age: float = 50.0,
+        stay_hours: int = 24,
+        has_lab: bool = True,
+        unittype: str = "Med-Surg ICU",
+        unitadmitsource: str = "Emergency Department",
+        unitstaytype: str = "admit",
+        ethnicity: str = "Caucasian",
+    ):
         self.patient_id = patient_id
-        in_time = datetime(2020, 5, 1, 10, 0, 0)
-        out_time = in_time + timedelta(hours=stay_hours)
-        
+        discharge_offset = float(stay_hours * 60)  # minutes
+
         self.events = {
-            "patients": [
+            "patient": [
                 type("Event", (), {
-                    "attr_dict": {
-                        "anchor_age": str(anchor_age),
-                        "anchor_year": str(anchor_year),
-                        "gender": "F",
-                    }
+                    "patientunitstayid": "s0",
+                    "unitdischargeoffset": discharge_offset,
+                    "gender": "Female",
+                    "age": str(age),
+                    "ethnicity": ethnicity,
+                    "admissionheight": 165.0,
+                    "admissionweight": 65.0,
+                    "unittype": unittype,
+                    "unitadmittime24": "14:00:00",
+                    "unitadmitsource": unitadmitsource,
+                    "unitvisitnumber": 1,
+                    "unitstaytype": unitstaytype,
+                    "hospitaldischargestatus": "Alive",
+                    "unitdischargestatus": "Alive",
                 })()
             ],
-            "admissions": [
+            "lab": [
                 type("Event", (), {
-                    "attr_dict": {
-                        "hadm_id": "h0",
-                        "hospital_expire_flag": "0",
-                    }
-                })()
-            ],
-            "icustays": [
-                type("Event", (), {
-                    "timestamp": in_time,
-                    "attr_dict": {
-                        "stay_id": "s0",
-                        "hadm_id": "h0",
-                        "outtime": out_time.strftime("%Y-%m-%d %H:%M:%S"),
-                    }
-                })()
-            ],
-            "labevents": [
-                type("Event", (), {
-                    "timestamp": in_time + timedelta(hours=2),
-                    "attr_dict": {
-                        "itemid": "50902",
-                        "valuenum": "105.0",
-                    }
+                    "patientunitstayid": "s0",
+                    "labresultoffset": 120.0,  # 2 hours into stay
+                    "labname": "potassium",
+                    "labresult": 4.2,
                 })()
             ] if has_lab else [],
         }
 
-    def get_events(self, event_type):
+    def get_events(self, event_type: str):
         return self.events.get(event_type, [])
 
 
@@ -206,8 +205,6 @@ def test_tpc_padding_invariance():
 
 def test_generate_tpc_tensors():
     """Tests forward-filling and exponential decay indicator 0.75^j calculation."""
-    seq_len = 4
-    num_features = 2
     raw = torch.tensor([
         [10.0, 0.0],
         [0.0,  5.0],
@@ -242,10 +239,10 @@ def test_generate_tpc_tensors():
 
 def test_task_filters_and_target():
     """Tests LengthOfStayTask filters (age > 18, stay >= 5h, has observation) and target format."""
-    task = LengthOfStayTask(lab_item_ids=["50902"])
+    task = LengthOfStayTask(lab_names=["potassium"])
     
     # Adult with valid stay and observation
-    p_valid = MockPatient(anchor_age=50, stay_hours=10, has_lab=True)
+    p_valid = MockPatient(age=50, stay_hours=10, has_lab=True)
     samples = task(p_valid)
     assert len(samples) == 1
     assert samples[0]["los"].shape == (10, 1)
@@ -255,15 +252,15 @@ def test_task_filters_and_target():
     assert samples[0]["los"][0].item() > samples[0]["los"][-1].item()
     
     # Child (< 18) should be skipped
-    p_child = MockPatient(anchor_age=16, stay_hours=10, has_lab=True)
+    p_child = MockPatient(age=16, stay_hours=10, has_lab=True)
     assert len(task(p_child)) == 0
     
     # Short stay (< 5h) should be skipped
-    p_short = MockPatient(anchor_age=50, stay_hours=3, has_lab=True)
+    p_short = MockPatient(age=50, stay_hours=3, has_lab=True)
     assert len(task(p_short)) == 0
     
     # Stay with no observations should be skipped
-    p_nolab = MockPatient(anchor_age=50, stay_hours=10, has_lab=False)
+    p_nolab = MockPatient(age=50, stay_hours=10, has_lab=False)
     assert len(task(p_nolab)) == 0
 
 
@@ -363,13 +360,15 @@ def test_tpc_no_decay_ablation():
 
 def test_static_features_deterministic_and_one_hot():
     """Tests that static feature extraction is deterministic, known categories land in assigned slots, and blocks sum to 1."""
-    patient = MockPatient(patient_id="p1", anchor_age=65, anchor_year=2020, stay_hours=24)
-    patient.events["admissions"][0].attr_dict.update({
-        "admission_location": "EMERGENCY ROOM",
-        "insurance": "Medicare",
-        "race": "WHITE",
-    })
-    patient.events["icustays"][0].attr_dict["first_careunit"] = "MICU"
+    patient = MockPatient(
+        patient_id="p1",
+        age=65.0,
+        stay_hours=24,
+        unittype="MICU",
+        unitadmitsource="Emergency Department",
+        unitstaytype="admit",
+        ethnicity="Caucasian",
+    )
     
     task = LengthOfStayTask()
     
@@ -384,10 +383,10 @@ def test_static_features_deterministic_and_one_hot():
     
     # 2. Verify known category lands in its exact assigned slot and unknown slot stays 0.0
     known_cats = {
-        "first_careunit": "MICU",
-        "admission_location": "EMERGENCY ROOM",
-        "insurance": "Medicare",
-        "race": "WHITE",
+        "unittype": "MICU",
+        "unitadmitsource": "Emergency Department",
+        "unitstaytype": "admit",
+        "ethnicity": "Caucasian",
     }
     offset = 11  # continuous & indicator features come first
     for cat_name, vocab in task.cat_vocabs.items():
@@ -402,13 +401,15 @@ def test_static_features_deterministic_and_one_hot():
     assert offset == task.static_dim
 
     # 3. Test unknown category handling sets the unknown slot and leaves known slots 0.0
-    patient_unk = MockPatient(patient_id="p_unk", anchor_age=65, anchor_year=2020, stay_hours=24)
-    patient_unk.events["admissions"][0].attr_dict.update({
-        "admission_location": "UNSEEN_LOCATION",
-        "insurance": "UNSEEN_INSURANCE",
-        "race": "UNSEEN_RACE",
-    })
-    patient_unk.events["icustays"][0].attr_dict["first_careunit"] = "UNSEEN_CAREUNIT"
+    patient_unk = MockPatient(
+        patient_id="p_unk",
+        age=65.0,
+        stay_hours=24,
+        unittype="UNSEEN_UNIT",
+        unitadmitsource="UNSEEN_SOURCE",
+        unitstaytype="UNSEEN_STAYTYPE",
+        ethnicity="UNSEEN_ETHNICITY",
+    )
     res_unk = task(patient_unk)
     static_unk = res_unk[0]["static"]
     
@@ -423,79 +424,57 @@ def test_static_features_deterministic_and_one_hot():
 
 
 def test_baseline_values_outside_window_ignored(tmp_path):
-    """Tests that baseline chartevents outside [-24h, +5h] of admission are ignored."""
-    import gzip
-    
-    in_time = datetime(2020, 5, 1, 10, 0, 0)
-    
-    mock_dataset = type("MockDS", (), {
-        "iter_patients": lambda self: [
-            type("Patient", (), {
-                "get_events": lambda self, ev_type: [
-                    type("Stay", (), {
-                        "timestamp": in_time,
-                        "attr_dict": {"stay_id": "stay_100"}
-                    })()
-                ] if ev_type == "icustays" else []
-            })()
-        ]
-    })()
-    
-    # 1. -26h before admission -> outside window, ignored
-    # 2. -2h before admission -> inside window, weight = 75.0
-    # 3. +1h after admission -> inside window and closer to intime, weight = 76.0
-    # 4. +6h after admission -> outside window, ignored
-    # 5. height at +6h -> outside window, ignored completely
-    icu_dir = tmp_path / "icu"
-    icu_dir.mkdir(parents=True)
-    chart_file = icu_dir / "chartevents.csv.gz"
-    
+    """Tests that baseline measurements outside [-24h, +5h] = [-1440m, +300m] are ignored."""
+    # Create mock physicalExam.csv in tmp_path
+    # 1. -1560m (-26h) before admission -> outside window, ignored
+    # 2. -120m (-2h) before admission -> inside window, score = 3
+    # 3. +60m (+1h) after admission -> inside window and closer to intime, score = 4
+    # 4. +360m (+6h) after admission -> outside window, ignored
     csv_content = (
-        "stay_id,charttime,itemid,valuenum\n"
-        "stay_100,2020-04-30 08:00:00,226512,70.0\n"
-        "stay_100,2020-05-01 08:00:00,226512,75.0\n"
-        "stay_100,2020-05-01 11:00:00,226512,76.0\n"
-        "stay_100,2020-05-01 16:00:00,226512,85.0\n"
-        "stay_100,2020-05-01 16:00:00,226730,175.0\n"
+        "patientunitstayid,physicalexamoffset,physicalexampath,physicalexamtext\n"
+        "stay_100,-1560,notes/Progress Notes/Physical Exam/Physical Exam/Neurologic/GCS/Eyes Score/2,2\n"
+        "stay_100,-120,notes/Progress Notes/Physical Exam/Physical Exam/Neurologic/GCS/Eyes Score/3,3\n"
+        "stay_100,60,notes/Progress Notes/Physical Exam/Physical Exam/Neurologic/GCS/Eyes Score/4,4\n"
+        "stay_100,360,notes/Progress Notes/Physical Exam/Physical Exam/Neurologic/GCS/Eyes Score/1,1\n"
     )
-    with gzip.open(chart_file, "wt") as f:
-        f.write(csv_content)
-        
-    _, baseline_static_by_stay = load_chartevents_cache(str(tmp_path), mock_dataset)
+    pe_file = tmp_path / "physicalExam.csv"
+    pe_file.write_text(csv_content)
+    
+    _, baseline_static_by_stay = load_eicu_vitals_cache(str(tmp_path))
     
     assert "stay_100" in baseline_static_by_stay
     base = baseline_static_by_stay["stay_100"]
-    # Weight at +1h should be selected (closest to admission intime within [-24h, +5h])
-    assert "weight" in base
-    assert base["weight"] == 76.0
-    # Height was only recorded at +6h (outside [-24h, +5h]), so it must be ignored
-    assert "height" not in base
+    # Eyes score at +60m should be selected (closer to admission within [-1440m, +300m])
+    assert "eyes" in base
+    assert base["eyes"] == 4.0
 
 
 def test_select_qualifying_labs_respects_stay_window():
     """Tests that select_qualifying_labs counts labs strictly within the ICU stay window."""
-    in_time = datetime(2020, 5, 1, 10, 0, 0)
+    stay_minutes = 48 * 60  # 48 hours = 2880 minutes
     p = MockPatient(
-        patient_id="p_labs", anchor_age=40, anchor_year=2020, stay_hours=48, has_lab=False
+        patient_id="p_labs", age=40.0, stay_hours=48, has_lab=False
     )
 
-    def ev(item, hours):
+    def ev(name, minutes):
         return type(
             "Event",
             (),
             {
-                "timestamp": in_time + timedelta(hours=hours),
-                "attr_dict": {"itemid": item, "valuenum": "1.0"},
+                "patientunitstayid": "s0",
+                "labresultoffset": minutes,
+                "labname": name,
+                "labresult": 1.0,
             },
         )()
 
     labs = []
     for item in ["A1", "A2", "A3", "A4", "A5"]:  # 4 in-window obs each -> qualify
-        labs += [ev(item, h) for h in (1, 5, 10, 20)]
-    labs += [ev("X", 10)]                         # 1 in-window obs
-    labs += [ev("X", -h) for h in range(1, 6)]    # 5 before admission
-    labs += [ev("X", 49 + h) for h in range(5)]   # 5 after discharge
-    p.events["labevents"] = labs
+        labs += [ev(item, m) for m in (60, 300, 600, 1200)]
+    labs += [ev("X", 600)]                          # 1 in-window obs
+    labs += [ev("X", -m) for m in (60, 120, 180, 240, 300)]  # 5 before admission
+    labs += [ev("X", stay_minutes + m) for m in (60, 120, 180, 240, 300)]  # 5 after discharge
+    p.events["lab"] = labs
 
     ds = type("MockDS", (), {"iter_patients": lambda self: [p]})()
     selected, met = select_qualifying_labs(
@@ -512,17 +491,18 @@ def test_select_qualifying_labs_respects_stay_window():
 
 def test_select_qualifying_labs_fallback():
     """Tests that select_qualifying_labs triggers fallback when criteria are not met."""
-    in_time = datetime(2020, 5, 1, 10, 0, 0)
     p = MockPatient(
-        patient_id="p_fallback", anchor_age=40, anchor_year=2020, stay_hours=48, has_lab=False
+        patient_id="p_fallback", age=40.0, stay_hours=48, has_lab=False
     )
-    p.events["labevents"] = [
+    p.events["lab"] = [
         type(
             "Event",
             (),
             {
-                "timestamp": in_time + timedelta(hours=10),
-                "attr_dict": {"itemid": "50902", "valuenum": "101"},
+                "patientunitstayid": "s0",
+                "labresultoffset": 600.0,
+                "labname": "potassium",
+                "labresult": 4.0,
             },
         )()
     ]
@@ -538,7 +518,7 @@ def test_select_qualifying_labs_fallback():
         max_labs=45,
     )
     assert threshold_met is False
-    assert selected == DEFAULT_LAB_ITEMS
+    assert selected == DEFAULT_LAB_NAMES
 
 
 def test_bucket_batch_sampler():

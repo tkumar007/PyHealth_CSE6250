@@ -1,6 +1,7 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
+
 from pyhealth.models import BaseModel
 
 
@@ -42,7 +43,7 @@ class TPCBlock(nn.Module):
         dropout: float = 0.1,
         use_decay: bool = True,
     ):
-        super(TPCBlock, self).__init__()
+        super().__init__()
         self.n = layer_idx
         self.k = kernel_size
         self.d = layer_idx  # Dilation increments by 1 with each layer (d = n)
@@ -151,7 +152,7 @@ class TPC(BaseModel):
         feature_keys: List of input feature keys (e.g. ['vitals', 'static']).
         label_key: Target key (defaults to 'los').
         mode: Prediction mode ('regression').
-        continuous_dim (int): Number of time series features (F, e.g. 12, 87, or 101). Default: 12.
+        continuous_dim (int): Number of time series features (F, e.g. 12 or 87 for eICU). Default: 12.
         static_dim (int): Number of static features (S). Default: 0.
         n_layers (int): Number of stacked TPC blocks (N). Default: 3.
         temp_dim (int): Temporal output channels per feature (Y). Default: 8.
@@ -211,7 +212,7 @@ class TPC(BaseModel):
         alpha: float = 0.5,
         **kwargs,
     ):
-        super(TPC, self).__init__(dataset=dataset, **kwargs)
+        super().__init__(dataset=dataset, **kwargs)
         self.label_key = label_key or (self.label_keys[0] if getattr(self, "label_keys", None) else "los")
         self.mode = mode or "regression"
         
@@ -276,7 +277,7 @@ class TPC(BaseModel):
         elif y_true.dim() == 2:
             y_true = y_true.unsqueeze(-1) if y_pred.dim() == 3 else y_true
             
-        B, T = y_pred.shape[0], y_pred.shape[1]
+        T = y_pred.shape[1]
         
         # Build valid time mask (excludes zero padding and warmup hours t < min_time)
         if mask is not None:
@@ -334,7 +335,7 @@ class TPC(BaseModel):
         
         # Ensure vitals has shape (batch_size, seq_len, continuous_dim)
         vitals_tensor = raw_vitals if raw_vitals.dim() == 3 else raw_vitals.unsqueeze(1)
-        B, T, F_dim = vitals_tensor.shape
+        B, T, _ = vitals_tensor.shape
         
         # 2. Extract or compute decay indicators: 0.75^j (if use_decay is enabled)
         x_raw = vitals_tensor.transpose(1, 2).float()
