@@ -1,5 +1,5 @@
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -9,14 +9,16 @@ repo_root = str(Path(__file__).resolve().parents[2])
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
-from examples.eicu_los_tpc import (
+from pyhealth.tasks import LengthOfStayTPCeICU
+from pyhealth.tasks.length_of_stay_tpc_eicu import (
     DEFAULT_LAB_NAMES,
     BucketBatchSampler,
-    LengthOfStayTask,
     generate_tpc_tensors,
     load_eicu_vitals_cache,
     select_qualifying_labs,
 )
+
+LengthOfStayTask = LengthOfStayTPCeICU
 from pyhealth.datasets import collate_fn_dict_with_padding
 from pyhealth.models.tpc import TPC
 
