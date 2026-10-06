@@ -57,6 +57,7 @@ Implementation Notes & Methodological Alignment:
      generate a new cache directory. Users can also call dataset.clean_tmpdir() to clear.
 """
 
+import argparse
 import os
 from itertools import chain
 
@@ -217,7 +218,16 @@ def run_ablation_study(
 
 
 if __name__ == "__main__":
-    eicu_root = "./test-resources/core/eicudemo"
+    parser = argparse.ArgumentParser(description="eICU Length of Stay Prediction with TPC")
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default=os.environ.get("EICU_ROOT", "./test-resources/core/eicudemo"),
+        help="Path to eICU directory containing CSV files (default: ./test-resources/core/eicudemo)",
+    )
+    args = parser.parse_args()
+
+    eicu_root = args.data_dir
     if not os.path.exists(eicu_root):
         eicu_root = "https://storage.googleapis.com/pyhealth/eicu-demo/"
 

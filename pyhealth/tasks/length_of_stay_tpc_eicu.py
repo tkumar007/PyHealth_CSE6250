@@ -113,6 +113,10 @@ def select_qualifying_labs(
     Returns:
         selected_labs: List of qualifying lab names.
         threshold_met: True if selected via statistical thresholds, False if fallback was used.
+
+    Examples:
+        >>> from pyhealth.tasks.length_of_stay_tpc_eicu import select_qualifying_labs
+        >>> # labs, ok = select_qualifying_labs(dataset, {"stay_1"}) # doctest: +SKIP
     """
     total_train_stays = 0
     obs_per_lab: dict[str, int] = {}
@@ -206,6 +210,10 @@ def load_eicu_vitals_cache(
       specifically for physical dimensions like height and weight).
     - Baseline measurements are restricted strictly to [-24h, +5h] relative to ICU admission.
     - If multiple baseline measurements exist in the window, sorts by proximity to admission time.
+
+    Examples:
+        >>> from pyhealth.tasks.length_of_stay_tpc_eicu import load_eicu_vitals_cache
+        >>> # vitals, baseline = load_eicu_vitals_cache("./data") # doctest: +SKIP
     """
     vitals_by_stay: dict[str, list[tuple[int, str, float]]] = {}
     baseline_static_by_stay: dict[str, dict[str, float]] = {}
@@ -322,6 +330,12 @@ def compute_empirical_training_stats(
     - Time-series: empirical mean and std with 1st/99th percentile clipping.
     - Continuous static: empirical mean, std, and median (for imputation) on training stays.
     - Categorical static: deterministic sorted vocabulary for one-hot encoding.
+
+    Examples:
+        >>> from pyhealth.tasks.length_of_stay_tpc_eicu import compute_empirical_training_stats
+        >>> # stats, counts, s_stats, vocabs = compute_empirical_training_stats(
+        ... #     dataset, {"p1"}, ["potassium"]
+        ... # ) # doctest: +SKIP
     """
     ts_vals: dict[str, list[float]] = {name: [] for name in lab_names}
     if vitals_by_stay:
@@ -492,6 +506,15 @@ def generate_tpc_tensors(
     - Forward-fills across missing hourly intervals.
     - Computes decay indicators: x''_t = 0.75^j, where j is hours since last recording.
     - If never observed, value is 0.0 (population mean) and decay indicator is 0.0.
+
+    Examples:
+        >>> import torch
+        >>> from pyhealth.tasks.length_of_stay_tpc_eicu import generate_tpc_tensors
+        >>> grid = torch.ones((24, 6))
+        >>> mask = torch.ones((24, 6))
+        >>> ff, decay = generate_tpc_tensors(grid, mask)
+        >>> ff.shape
+        torch.Size([24, 6])
     """
     seq_len, num_features = raw_grid.shape
     vitals_ff = raw_grid.clone()
@@ -826,7 +849,14 @@ LengthOfStayPredictionTPCeICU = LengthOfStayTPCeICU
 
 
 class MapDataset(torch.utils.data.Dataset):
-    """In-memory map-style dataset enabling custom BatchSampler and length bucketing."""
+    """In-memory map-style dataset enabling custom BatchSampler and length bucketing.
+
+    Examples:
+        >>> from pyhealth.tasks.length_of_stay_tpc_eicu import MapDataset
+        >>> ds = MapDataset([{"patient_id": "p1"}, {"patient_id": "p2"}])
+        >>> len(ds)
+        2
+    """
     def __init__(self, samples: list[dict]):
         self.samples = samples
 
@@ -843,6 +873,12 @@ class BucketBatchSampler(Sampler[list[int]]):
     Partitions stays into length-sorted buckets and shuffles batch execution order
     every epoch. Allows resetting epoch counter to ensure strictly unconfounded
     ablation comparisons across model configurations.
+
+    Examples:
+        >>> from pyhealth.tasks.length_of_stay_tpc_eicu import BucketBatchSampler
+        >>> sampler = BucketBatchSampler(lengths=[10, 15, 20, 25], batch_size=2, shuffle=False)
+        >>> list(sampler)
+        [[0, 1], [2, 3]]
     """
     def __init__(
         self,
