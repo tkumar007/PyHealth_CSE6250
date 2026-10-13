@@ -1,10 +1,10 @@
-"""Temporal Pointwise Convolution (TPC) Length of Stay Prediction Task for eICU.
-
-Reproduces the computational pipeline and task definition of:
-    "Temporal Pointwise Convolutional Networks for Length of Stay Prediction
-     in the Intensive Care Unit"
-    Emma Rocheteau, Pietro Liò, Stephanie Hyland (ACM CHIL 2021)
-    https://doi.org/10.1145/3450439.3451860
+"""Author: Tamjit Kumar
+NetID: tkumar70
+Paper: Temporal Pointwise Convolutional Networks for Length of Stay Prediction
+       in the Intensive Care Unit
+Paper Link: https://doi.org/10.1145/3450439.3451860
+Description: Temporal Pointwise Convolution (TPC) Length of Stay Prediction Task
+             and multi-modal dynamic feature extraction pipeline for eICU.
 
 Primary Dataset:
     eICU Collaborative Research Database (v2.0)
@@ -23,8 +23,10 @@ Key Features:
    - Categorical (One-Hot Encoded with Unknown Slot): Unit Type, Admission Source,
      Unit Stay Type, Ethnicity.
 3. Target Alignment:
-   - Hourly remaining LoS in days: max((unitdischargeoffset - 60*(t+1))/1440, 1/48).
-   - Multitask in-hospital mortality label: hospitaldischargestatus == "Expired".
+   - Hourly remaining LoS in days:
+     max((unitdischargeoffset - 60*(t+1))/1440, 1/48).
+   - Multitask in-hospital mortality label:
+     hospitaldischargestatus == "Expired".
 """
 
 from __future__ import annotations
@@ -91,32 +93,35 @@ LOS_FLOOR_DAYS = 1.0 / 48.0
 
 
 def select_qualifying_labs(
-    dataset: eICUDataset,
+    dataset: eICUDataset | Any,
     train_pids: set[str],
     min_prevalence: float = 0.25,
     min_avg_obs: float = 3.0,
     max_labs: int = 45,
 ) -> tuple[list[str], bool]:
     """Dynamically selects laboratory tests conforming to the paper's inclusion rule.
-    
+
     Evaluates ICU stays strictly on the training set to prevent data leakage.
-    Counts measurements strictly within each ICU stay window [0, min(unitdischargeoffset, 20160 minutes)).
-    Cohort filters (adults > 18, stays >= 5 hours) match the task definition exactly.
-    
+    Counts measurements strictly within each ICU stay window
+    [0, min(unitdischargeoffset, 20160 minutes)).
+    Cohort filters (adults > 18, stays >= 5 hours) match the task definition.
+
     Args:
         dataset: eICUDataset instance.
         train_pids: Patient IDs belonging to the training split.
         min_prevalence: Minimum stay prevalence threshold (default: 0.25).
         min_avg_obs: Minimum average observations per stay (default: 3.0).
-        max_labs: Cap on number of qualifying labs (defaults to 45, matching eICU ld_commonlabs).
-            
+        max_labs: Cap on number of qualifying labs (defaults to 45).
+
     Returns:
-        selected_labs: List of qualifying lab names.
-        threshold_met: True if selected via statistical thresholds, False if fallback was used.
+        tuple[list[str], bool]: Selected lab names and boolean indicator
+            signifying whether statistical thresholds were met.
 
     Examples:
-        >>> from pyhealth.tasks.length_of_stay_tpc_eicu import select_qualifying_labs
-        >>> # labs, ok = select_qualifying_labs(dataset, {"stay_1"}) # doctest: +SKIP
+        >>> from pyhealth.tasks.length_of_stay_tpc_eicu import (
+        ...     select_qualifying_labs,
+        ... )
+        >>> labs, ok = select_qualifying_labs(None, {"stay_1"})  # doctest: +SKIP
     """
     total_train_stays = 0
     obs_per_lab: dict[str, int] = {}
@@ -166,27 +171,28 @@ def select_qualifying_labs(
                     loff = float(loff_raw)
                 except (ValueError, TypeError):
                     continue
-                if not (0.0 <= loff < stay_end):
-                    continue
-
-                name_raw = getattr(lab, "labname", None)
-                val_raw = getattr(lab, "labresult", None)
-                if name_raw is not None and val_raw is not None:
-                    lab_name = str(name_raw).strip()
-                    stay_labs.add(lab_name)
-                    obs_per_lab[lab_name] = obs_per_lab.get(lab_name, 0) + 1
+                # Count measurements strictly within stay window
+                if 0.0 <= loff < stay_end:
+                    lab_name_raw = getattr(lab, "labname", None)
+                    if lab_name_raw is not None:
+                        lab_name = str(lab_name_raw).strip()
+                        obs_per_lab[lab_name] = obs_per_lab.get(lab_name, 0) + 1
+                        stay_labs.add(lab_name)
 
             for lab_name in stay_labs:
                 stays_per_lab[lab_name] = stays_per_lab.get(lab_name, 0) + 1
 
-    qualifying = []
-    for lab_name, count in stays_per_lab.items():
-        prev = count / max(total_train_stays, 1)
-        avg_obs = obs_per_lab[lab_name] / count
-        if prev >= min_prevalence and avg_obs > min_avg_obs:
-            qualifying.append((prev, avg_obs, lab_name))
+    if total_train_stays == 0:
+        return DEFAULT_LAB_NAMES, False
 
-    qualifying.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    qualifying: list[tuple[float, float, str]] = []
+    for lab_name, obs_count in obs_per_lab.items():
+        prevalence = stays_per_lab.get(lab_name, 0) / float(total_train_stays)
+        avg_obs = obs_count / float(total_train_stays)
+        if prevalence >= min_prevalence and avg_obs > min_avg_obs:
+            qualifying.append((prevalence, avg_obs, lab_name))
+
+    qualifying.sort(key=lambda item: (item[0], item[1]), reverse=True)
     selected = [lab_name for _, _, lab_name in qualifying[:max_labs]]
 
     if len(selected) < 5:
@@ -199,21 +205,26 @@ def load_eicu_vitals_cache(
     dataset: eICUDataset | None = None,
 ) -> tuple[dict[str, list[tuple[int, str, float]]], dict[str, dict[str, float]]]:
     """Loads bedside vital signs and admission-window baseline measurements for eICU.
-    
-    Adheres to Rocheteau et al. (adapted from flat_features.sql with true elapsed-time window):
-    - Vital signs are sorted chronologically by offset so "last value in the hour wins"
+
+    Adheres to Rocheteau et al. (adapted from flat_features.sql):
+    - Vital signs are sorted chronologically by offset so "last value in hour wins"
       strictly follows temporal order.
-    - Continuous vitals are returned as lightweight (hour, vital_key, val) primitive tuples
-      rather than nested dictionaries with Timestamp objects. This reduces serialization
-      and RAM overhead and eliminates pickling bottlenecks across multiprocessing workers.
-    - Preserves legitimate zero/negative measurements (filtering non-positive values
-      specifically for physical dimensions like height and weight).
-    - Baseline measurements are restricted strictly to [-24h, +5h] relative to ICU admission.
-    - If multiple baseline measurements exist in the window, sorts by proximity to admission time.
+    - Continuous vitals are returned as lightweight (hour, vital_key, val) tuples.
+    - Preserves legitimate zero/negative measurements.
+    - Baseline measurements are restricted strictly to [-24h, +5h] relative to ICU.
+    - If multiple baseline measurements exist in window, sorts by proximity to intime.
+
+    Args:
+        eicu_root: Path to eICU directory containing CSV files.
+        dataset: Optional eICUDataset instance for stay validation.
+
+    Returns:
+        tuple: (vitals_by_stay, baseline_static_by_stay) dictionaries mapping stay ID
+            to list of vital sign tuples and baseline assessment dictionaries.
 
     Examples:
         >>> from pyhealth.tasks.length_of_stay_tpc_eicu import load_eicu_vitals_cache
-        >>> # vitals, baseline = load_eicu_vitals_cache("./data") # doctest: +SKIP
+        >>> vitals, baseline = load_eicu_vitals_cache("./data")  # doctest: +SKIP
     """
     vitals_by_stay: dict[str, list[tuple[int, str, float]]] = {}
     baseline_static_by_stay: dict[str, dict[str, float]] = {}
@@ -221,15 +232,24 @@ def load_eicu_vitals_cache(
     # 1. Check for physicalExam.csv in eicu_root
     pe_csv = os.path.join(eicu_root, "physicalExam.csv")
     pe_gz = os.path.join(eicu_root, "physicalExam.csv.gz")
-    pe_path = pe_csv if os.path.exists(pe_csv) else (pe_gz if os.path.exists(pe_gz) else None)
+    pe_path = pe_csv if os.path.exists(pe_csv) else (
+        pe_gz if os.path.exists(pe_gz) else None
+    )
 
     if pe_path is not None:
         df_pe = pd.read_csv(
             pe_path,
-            usecols=["patientunitstayid", "physicalexamoffset", "physicalexampath", "physicalexamtext"],
+            usecols=[
+                "patientunitstayid",
+                "physicalexamoffset",
+                "physicalexampath",
+                "physicalexamtext",
+            ],
         )
         df_pe = df_pe[df_pe["physicalexamtext"].notnull()]
-        df_pe["offset"] = pd.to_numeric(df_pe["physicalexamoffset"], errors="coerce")
+        df_pe["offset"] = pd.to_numeric(
+            df_pe["physicalexamoffset"], errors="coerce"
+        )
         df_pe = df_pe[df_pe["offset"].notnull()]
 
         # 1a. Continuous bedside vitals (sorted chronologically by offset)
@@ -251,8 +271,10 @@ def load_eicu_vitals_cache(
                     break
 
         # 1b. Baseline measurements restricted strictly to [-24h, +5h] = [-1440m, +300m]
-        # Sorted by absolute distance to admission intime (offset=0) so closest observation wins
-        df_windowed = df_pe[(df_pe["offset"] >= -1440.0) & (df_pe["offset"] <= 300.0)].copy()
+        # Sorted by absolute distance to admission intime (offset=0)
+        df_windowed = df_pe[
+            (df_pe["offset"] >= -1440.0) & (df_pe["offset"] <= 300.0)
+        ].copy()
         df_windowed["abs_offset"] = df_windowed["offset"].abs()
         df_windowed.sort_values(by="abs_offset", inplace=True)
 
@@ -275,7 +297,9 @@ def load_eicu_vitals_cache(
     # 2. Check for optional vitalPeriodic.csv / vitalPeriodic.csv.gz
     vp_csv = os.path.join(eicu_root, "vitalPeriodic.csv")
     vp_gz = os.path.join(eicu_root, "vitalPeriodic.csv.gz")
-    vp_path = vp_csv if os.path.exists(vp_csv) else (vp_gz if os.path.exists(vp_gz) else None)
+    vp_path = vp_csv if os.path.exists(vp_csv) else (
+        vp_gz if os.path.exists(vp_gz) else None
+    )
 
     if vp_path is not None:
         try:
@@ -303,7 +327,9 @@ def load_eicu_vitals_cache(
                             c_val = getattr(row, c_name)
                             if pd.notnull(c_val):
                                 try:
-                                    vitals_by_stay[sid].append((hour, vkey, float(c_val)))
+                                    vitals_by_stay[sid].append(
+                                        (hour, vkey, float(c_val))
+                                    )
                                 except (ValueError, TypeError):
                                     pass
         except (OSError, ValueError):
@@ -313,7 +339,7 @@ def load_eicu_vitals_cache(
 
 
 def compute_empirical_training_stats(
-    dataset: eICUDataset,
+    dataset: eICUDataset | Any,
     train_pids: set[str],
     lab_names: list[str],
     vitals_by_stay: dict[str, list[tuple[int, str, float]]] | None = None,
@@ -324,18 +350,36 @@ def compute_empirical_training_stats(
     dict[str, tuple[float, float, float]],
     dict[str, list[str]],
 ]:
-    """Computes empirical training statistics and builds fixed categorical vocabularies.
-    
-    Strictly isolated to the training split and identical cohort filters (adults > 18, stays >= 5h):
+    """Computes empirical training statistics and builds fixed categorical vocabs.
+
+    Strictly isolated to training split and cohort filters (adults > 18, stays >= 5h):
     - Time-series: empirical mean and std with 1st/99th percentile clipping.
-    - Continuous static: empirical mean, std, and median (for imputation) on training stays.
+    - Continuous static: empirical mean, std, and median (for imputation).
     - Categorical static: deterministic sorted vocabulary for one-hot encoding.
 
+    Args:
+        dataset: eICUDataset instance.
+        train_pids: Set of patient IDs belonging to training split.
+        lab_names: List of laboratory test names to include.
+        vitals_by_stay: Optional bedside vitals cache dictionary.
+        baseline_static_by_stay: Optional baseline measurements dictionary.
+
+    Returns:
+        tuple: (ts_stats, ts_counts, static_stats, cat_vocabs) where:
+            ts_stats: Dict mapping time-series item ID to (mean, std).
+            ts_counts: Dict mapping time-series item ID to observation count.
+            static_stats: Dict mapping continuous static features to
+                (mean, std, median).
+            cat_vocabs: Dict mapping categorical static features to sorted
+                category lists.
+
     Examples:
-        >>> from pyhealth.tasks.length_of_stay_tpc_eicu import compute_empirical_training_stats
-        >>> # stats, counts, s_stats, vocabs = compute_empirical_training_stats(
-        ... #     dataset, {"p1"}, ["potassium"]
-        ... # ) # doctest: +SKIP
+        >>> from pyhealth.tasks.length_of_stay_tpc_eicu import (
+        ...     compute_empirical_training_stats,
+        ... )
+        >>> stats, counts, s_stats, vocabs = compute_empirical_training_stats(
+        ...     None, {"p1"}, ["potassium"]
+        ... )  # doctest: +SKIP
     """
     ts_vals: dict[str, list[float]] = {name: [] for name in lab_names}
     if vitals_by_stay:
@@ -344,7 +388,12 @@ def compute_empirical_training_stats(
                 ts_vals[vid] = []
 
     continuous_static_vals: dict[str, list[float]] = {
-        "age": [], "height": [], "weight": [], "eyes": [], "motor": [], "verbal": []
+        "age": [],
+        "height": [],
+        "weight": [],
+        "eyes": [],
+        "motor": [],
+        "verbal": [],
     }
     cat_sets: dict[str, set[str]] = {
         "unittype": set(),
@@ -352,7 +401,7 @@ def compute_empirical_training_stats(
         "unitstaytype": set(),
         "ethnicity": set(),
     }
-    
+
     train_stay_ids: set[str] = set()
 
     for patient in dataset.iter_patients():
@@ -391,7 +440,9 @@ def compute_empirical_training_stats(
 
             # Static categoricals
             cat_sets["unittype"].add(str(getattr(stay, "unittype", "")))
-            cat_sets["unitadmitsource"].add(str(getattr(stay, "unitadmitsource", "")))
+            cat_sets["unitadmitsource"].add(
+                str(getattr(stay, "unitadmitsource", ""))
+            )
             cat_sets["unitstaytype"].add(str(getattr(stay, "unitstaytype", "")))
             cat_sets["ethnicity"].add(str(getattr(stay, "ethnicity", "")))
 
@@ -454,7 +505,9 @@ def compute_empirical_training_stats(
     # 1. Empirical time-series normalization stats (mean, std)
     ts_stats: dict[str, tuple[float, float]] = {}
     ts_counts: dict[str, int] = {}
-    all_keys = list(lab_names) + ([k for k in CORE_VITALS_MAP] if vitals_by_stay else [])
+    all_keys = list(lab_names) + (
+        [k for k in CORE_VITALS_MAP] if vitals_by_stay else []
+    )
 
     for item_id in all_keys:
         vals = ts_vals.get(item_id, [])
@@ -501,11 +554,19 @@ def generate_tpc_tensors(
     mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generates forward-filled time series and decay indicator tensors.
-    
+
     Conforms to Rocheteau et al. (ACM CHIL 2021) Section 4.1:
     - Forward-fills across missing hourly intervals.
     - Computes decay indicators: x''_t = 0.75^j, where j is hours since last recording.
     - If never observed, value is 0.0 (population mean) and decay indicator is 0.0.
+
+    Args:
+        raw_grid: 2D Tensor of shape (seq_len, num_features) with observations.
+        mask: 2D Tensor of shape (seq_len, num_features) with binary indicators (1=obs).
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Forward-filled time series tensor and
+            exponential decay indicator tensor, each of shape (seq_len, num_features).
 
     Examples:
         >>> import torch
@@ -519,10 +580,12 @@ def generate_tpc_tensors(
     seq_len, num_features = raw_grid.shape
     vitals_ff = raw_grid.clone()
     vitals_decay = torch.zeros_like(raw_grid)
-    time_since_last = torch.full((num_features,), float("inf"), dtype=torch.float32)
+    time_since_last = torch.full(
+        (num_features,), float("inf"), dtype=torch.float32
+    )
 
     for t in range(seq_len):
-        measured = (mask[t] == 1.0)
+        measured = mask[t] == 1.0
         time_since_last[measured] = 0.0
         time_since_last[~measured] += 1.0
 
@@ -538,11 +601,12 @@ def generate_tpc_tensors(
 
 class LengthOfStayTPCeICU(BaseTask):
     """ICU Remaining Length of Stay (LoS) Prediction Task for eICU.
-    
+
     Reproduces the multi-modal dynamic time series and static feature pipeline from:
-    'Temporal Pointwise Convolutional Networks for Length of Stay Prediction in the Intensive Care Unit'
+    'Temporal Pointwise Convolutional Networks for Length of Stay Prediction
+    in the Intensive Care Unit'
     (Emma Rocheteau, Pietro Liò, Stephanie Hyland, ACM CHIL 2021).
-    
+
     Key Cohort & Task Criteria (Section 4 & 5.1.1):
     - Adult ICU patients (> 18 years old at admission).
     - Minimum ICU length of stay of 5 hours (unitdischargeoffset >= 300 minutes).
@@ -566,10 +630,11 @@ class LengthOfStayTPCeICU(BaseTask):
         >>> dataset = eICUDataset(
         ...     root="/path/to/eicu-crd/2.0",
         ...     tables=["lab", "physicalexam"],
-        ... ) # doctest: +SKIP
-        >>> task = LengthOfStayTPCeICU() # doctest: +SKIP
-        >>> sample_dataset = dataset.set_task(task) # doctest: +SKIP
+        ... )  # doctest: +SKIP
+        >>> task = LengthOfStayTPCeICU()  # doctest: +SKIP
+        >>> sample_dataset = dataset.set_task(task)  # doctest: +SKIP
     """
+
     task_name: ClassVar[str] = "eICU Remaining Length of Stay Prediction (TPC)"
     input_schema: ClassVar[dict[str, str]] = {
         "vitals": "tensor",
@@ -593,16 +658,22 @@ class LengthOfStayTPCeICU(BaseTask):
         max_stay_hours: int = 336,
     ):
         super().__init__()
-        self.lab_names = lab_names if lab_names is not None else DEFAULT_LAB_NAMES
+        self.lab_names = (
+            lab_names if lab_names is not None else DEFAULT_LAB_NAMES
+        )
         self.vitals_by_stay = vitals_by_stay or {}
         self.baseline_static_by_stay = baseline_static_by_stay or {}
         self.norm_stats = norm_stats or {}
         self.max_stay_hours = max_stay_hours
 
         # Construct time-series feature mapping
-        self.vital_keys = list(CORE_VITALS_MAP.keys()) if self.vitals_by_stay else []
+        self.vital_keys = (
+            list(CORE_VITALS_MAP.keys()) if self.vitals_by_stay else []
+        )
         self.all_feature_ids = self.vital_keys + self.lab_names
-        self.feature_map = {item_id: idx for idx, item_id in enumerate(self.all_feature_ids)}
+        self.feature_map = {
+            item_id: idx for idx, item_id in enumerate(self.all_feature_ids)
+        }
         self.continuous_dim = len(self.all_feature_ids)
         self.num_features = self.continuous_dim
 
@@ -619,18 +690,37 @@ class LengthOfStayTPCeICU(BaseTask):
         # Deterministic categorical vocabularies
         self.cat_vocabs = cat_vocabs or {
             "unittype": ["Med-Surg ICU", "CTICU", "MICU", "SICU", "CCU-CTICU"],
-            "unitadmitsource": ["Emergency Department", "Operating Room", "Floor", "Direct Admit"],
+            "unitadmitsource": [
+                "Emergency Department",
+                "Operating Room",
+                "Floor",
+                "Direct Admit",
+            ],
             "unitstaytype": ["admit", "readmit", "transfer"],
-            "ethnicity": ["Caucasian", "African American", "Hispanic", "Asian"],
+            "ethnicity": [
+                "Caucasian",
+                "African American",
+                "Hispanic",
+                "Asian",
+            ],
         }
 
         # 11 continuous/indicator features + one-hot categories (each with unknown slot)
-        # Continuous (11): age, gender, adm_hour, height, missing_height, weight,
-        #                  missing_weight, eyes, motor, verbal, missing_gcs
-        self.static_dim = 11 + sum(len(vocab) + 1 for vocab in self.cat_vocabs.values())
+        self.static_dim = 11 + sum(
+            len(vocab) + 1 for vocab in self.cat_vocabs.values()
+        )
 
     @staticmethod
     def _one_hot(val: str, vocab: list[str]) -> list[float]:
+        """Encodes a categorical string value into a one-hot vector with unknown slot.
+
+        Args:
+            val: Categorical value to encode.
+            vocab: Deterministic sorted category list.
+
+        Returns:
+            list[float]: One-hot vector of length len(vocab) + 1.
+        """
         vec = [0.0] * (len(vocab) + 1)
         if val in vocab:
             vec[vocab.index(val)] = 1.0
@@ -639,6 +729,18 @@ class LengthOfStayTPCeICU(BaseTask):
         return vec
 
     def __call__(self, patient: Any) -> list[dict[str, Any]]:
+        """Processes a patient record into TPC task samples.
+
+        Extracts dynamic vital signs, laboratory tests, admission baseline
+        measurements, and hourly remaining length of stay targets.
+
+        Args:
+            patient: PyHealth Patient object with patient and lab events.
+
+        Returns:
+            list[dict[str, Any]]: List of sample dictionaries containing 'vitals',
+                'vitals_decay', 'static', 'mask', 'los', and 'mortality' tensors.
+        """
         samples = []
 
         patient_stays = patient.get_events(event_type="patient")
@@ -648,11 +750,14 @@ class LengthOfStayTPCeICU(BaseTask):
         patient_labs = patient.get_events(event_type="lab")
         # Pre-filter labs belonging to feature map and sort chronologically
         filtered_labs = [
-            lab for lab in patient_labs
+            lab
+            for lab in patient_labs
             if str(getattr(lab, "labname", "")).strip() in self.feature_map
             and getattr(lab, "labresultoffset", None) is not None
         ]
-        filtered_labs.sort(key=lambda lab: float(getattr(lab, "labresultoffset", 0.0)))
+        filtered_labs.sort(
+            key=lambda lab: float(getattr(lab, "labresultoffset", 0.0))
+        )
 
         for stay in patient_stays:
             sid = str(getattr(stay, "patientunitstayid", ""))
@@ -686,7 +791,7 @@ class LengthOfStayTPCeICU(BaseTask):
             mask = torch.zeros((T, self.num_features), dtype=torch.float32)
 
             # 1. Bedside vital signs from cache (if provided)
-            # Pre-sorted chronologically: last value in the hour overwrites earlier ones
+            # Pre-sorted chronologically: last value in hour overwrites earlier ones
             if self.vitals_by_stay and sid in self.vitals_by_stay:
                 for hour, vkey, val in self.vitals_by_stay[sid]:
                     if vkey not in self.feature_map:
@@ -694,7 +799,9 @@ class LengthOfStayTPCeICU(BaseTask):
                     f_idx = self.feature_map[vkey]
                     if 0 <= hour < T:
                         mean, std = self.norm_stats.get(vkey, (0.0, 1.0))
-                        raw_grid[hour, f_idx] = (val - mean) / (std if std > 1e-4 else 1.0)
+                        raw_grid[hour, f_idx] = (val - mean) / (
+                            std if std > 1e-4 else 1.0
+                        )
                         mask[hour, f_idx] = 1.0
 
             # 2. Laboratory tests from lab table
@@ -710,13 +817,17 @@ class LengthOfStayTPCeICU(BaseTask):
                         try:
                             val = float(val_raw)
                             f_idx = self.feature_map[lab_name]
-                            mean, std = self.norm_stats.get(lab_name, (0.0, 1.0))
-                            raw_grid[hour, f_idx] = (val - mean) / (std if std > 1e-4 else 1.0)
+                            mean, std = self.norm_stats.get(
+                                lab_name, (0.0, 1.0)
+                            )
+                            raw_grid[hour, f_idx] = (val - mean) / (
+                                std if std > 1e-4 else 1.0
+                            )
                             mask[hour, f_idx] = 1.0
                         except (ValueError, TypeError):
                             pass
 
-            # Require at least one recorded observation during the stay (Section 4.1)
+            # Require at least one recorded observation during stay (Section 4.1)
             if mask.sum() == 0:
                 continue
 
@@ -724,10 +835,12 @@ class LengthOfStayTPCeICU(BaseTask):
             vitals_ff, vitals_decay = generate_tpc_tensors(raw_grid, mask)
 
             # 4. Hourly Remaining LoS Target anchored at end of hour t:
-            # y_t = max((discharge_offset - (t + 1) * 60) / 1440.0, 1/48 days)
             los_targets = torch.tensor(
                 [
-                    max((discharge_offset - (t + 1) * 60.0) / 1440.0, LOS_FLOOR_DAYS)
+                    max(
+                        (discharge_offset - (t + 1) * 60.0) / 1440.0,
+                        LOS_FLOOR_DAYS,
+                    )
                     for t in range(T)
                 ],
                 dtype=torch.float32,
@@ -737,10 +850,10 @@ class LengthOfStayTPCeICU(BaseTask):
             mort_str = str(getattr(stay, "hospitaldischargestatus", "")).lower()
             mort_val = 1.0 if mort_str == "expired" else 0.0
 
-            # 6. Static Features (Continuous standardized + Missingness flags + One-Hot Categoricals)
+            # 6. Static Features
             base_s = self.baseline_static_by_stay.get(sid, {})
 
-            # Continuous standardized with train split parameters and median imputation
+            # Continuous standardized with train split parameters
             age_m, age_s, _ = self.static_stats["age"]
             age_norm = (age - age_m) / age_s
 
@@ -807,24 +920,41 @@ class LengthOfStayTPCeICU(BaseTask):
             gender_val = 1.0 if gender_str in ("male", "m") else 0.0
 
             # One-hot encoded categoricals with dedicated unknown slot
-            unittype_oh = self._one_hot(str(getattr(stay, "unittype", "")), self.cat_vocabs["unittype"])
-            unitadmitsource_oh = self._one_hot(str(getattr(stay, "unitadmitsource", "")), self.cat_vocabs["unitadmitsource"])
-            unitstaytype_oh = self._one_hot(str(getattr(stay, "unitstaytype", "")), self.cat_vocabs["unitstaytype"])
-            ethnicity_oh = self._one_hot(str(getattr(stay, "ethnicity", "")), self.cat_vocabs["ethnicity"])
+            unittype_oh = self._one_hot(
+                str(getattr(stay, "unittype", "")), self.cat_vocabs["unittype"]
+            )
+            unitadmitsource_oh = self._one_hot(
+                str(getattr(stay, "unitadmitsource", "")),
+                self.cat_vocabs["unitadmitsource"],
+            )
+            unitstaytype_oh = self._one_hot(
+                str(getattr(stay, "unitstaytype", "")),
+                self.cat_vocabs["unitstaytype"],
+            )
+            ethnicity_oh = self._one_hot(
+                str(getattr(stay, "ethnicity", "")),
+                self.cat_vocabs["ethnicity"],
+            )
 
-            static_list = [
-                age_norm,
-                gender_val,
-                adm_hour_norm,
-                height_norm,
-                missing_height,
-                weight_norm,
-                missing_weight,
-                eyes_norm,
-                motor_norm,
-                verbal_norm,
-                missing_gcs,
-            ] + unittype_oh + unitadmitsource_oh + unitstaytype_oh + ethnicity_oh
+            static_list = (
+                [
+                    age_norm,
+                    gender_val,
+                    adm_hour_norm,
+                    height_norm,
+                    missing_height,
+                    weight_norm,
+                    missing_weight,
+                    eyes_norm,
+                    motor_norm,
+                    verbal_norm,
+                    missing_gcs,
+                ]
+                + unittype_oh
+                + unitadmitsource_oh
+                + unitstaytype_oh
+                + ethnicity_oh
+            )
 
             static_tensor = torch.tensor(static_list, dtype=torch.float32)
             stay_mask = torch.ones(T, dtype=torch.bool)
@@ -857,29 +987,47 @@ class MapDataset(torch.utils.data.Dataset):
         >>> len(ds)
         2
     """
+
     def __init__(self, samples: list[dict]):
+        """Initializes MapDataset.
+
+        Args:
+            samples: List of sample dictionaries.
+        """
         self.samples = samples
 
     def __len__(self) -> int:
+        """Returns total number of samples."""
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict:
+        """Retrieves a sample dictionary by index.
+
+        Args:
+            idx: Index of sample.
+
+        Returns:
+            dict: Sample dictionary.
+        """
         return self.samples[idx]
 
 
 class BucketBatchSampler(Sampler[list[int]]):
-    """Batches sequences of similar length together to minimize zero padding overhead.
-    
+    """Batches sequences of similar length together to minimize zero padding.
+
     Partitions stays into length-sorted buckets and shuffles batch execution order
     every epoch. Allows resetting epoch counter to ensure strictly unconfounded
     ablation comparisons across model configurations.
 
     Examples:
         >>> from pyhealth.tasks.length_of_stay_tpc_eicu import BucketBatchSampler
-        >>> sampler = BucketBatchSampler(lengths=[10, 15, 20, 25], batch_size=2, shuffle=False)
+        >>> sampler = BucketBatchSampler(
+        ...     lengths=[10, 15, 20, 25], batch_size=2, shuffle=False
+        ... )
         >>> list(sampler)
         [[0, 1], [2, 3]]
     """
+
     def __init__(
         self,
         lengths: list[int],
@@ -887,6 +1035,14 @@ class BucketBatchSampler(Sampler[list[int]]):
         shuffle: bool = True,
         seed: int = 42,
     ):
+        """Initializes BucketBatchSampler.
+
+        Args:
+            lengths: Sequence lengths of all samples.
+            batch_size: Mini-batch size.
+            shuffle: Whether to shuffle batches each epoch. Default: True.
+            seed: Random seed for deterministic batch permutation. Default: 42.
+        """
         self.lengths = lengths
         self.batch_size = batch_size
         self.shuffle = shuffle
@@ -894,10 +1050,11 @@ class BucketBatchSampler(Sampler[list[int]]):
         self.epoch = 0
 
     def reset(self) -> None:
-        """Resets the epoch counter so all ablation configurations see the exact same batch orders."""
+        """Resets epoch counter so ablation configurations see identical batches."""
         self.epoch = 0
 
     def __iter__(self) -> Iterator[list[int]]:
+        """Yields mini-batch index lists grouped by sequence length."""
         indices = np.argsort(self.lengths)
         batches = [
             indices[i : i + self.batch_size].tolist()
@@ -911,4 +1068,5 @@ class BucketBatchSampler(Sampler[list[int]]):
         yield from batches
 
     def __len__(self) -> int:
+        """Returns total number of mini-batches."""
         return (len(self.lengths) + self.batch_size - 1) // self.batch_size
