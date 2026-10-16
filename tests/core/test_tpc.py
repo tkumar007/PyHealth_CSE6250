@@ -28,7 +28,9 @@ from pyhealth.tasks import LengthOfStayTPCeICU
 from pyhealth.tasks.length_of_stay_tpc_eicu import (
     DEFAULT_LAB_NAMES,
     BucketBatchSampler,
+    MapDataset,
     generate_tpc_tensors,
+    get_valid_eicu_stay_ids,
     load_eicu_vitals_cache,
     select_qualifying_labs,
 )
@@ -54,6 +56,14 @@ class MockDataset:
 
     def get_all_tokens(self, key):
         return self.tokens.get(key, [])
+
+    def __getitem__(self, idx):
+        return {
+            "vitals": torch.randn(24, 16),
+            "static": torch.randn(44),
+            "los": torch.ones(24, 1),
+            "mortality": torch.tensor([0.0]),
+        }
 
 
 class MockPatient:
@@ -391,6 +401,24 @@ class TestTPCModel(unittest.TestCase):
 
         torch.testing.assert_close(out1, out2)
 
+    def test_tpc_dataset_dimension_inference(self):
+        """Verifies input dimensions are inferred from dataset and logit is returned."""
+        ds = MockDataset()
+        model = TPC(dataset=ds)
+        self.assertEqual(model.continuous_dim, 16)
+        self.assertEqual(model.static_dim, 44)
+
+        out = model(vitals=torch.randn(2, 24, 16), static=torch.randn(2, 44))
+        self.assertIn("y_prob", out)
+        self.assertIn("logit", out)
+        self.assertEqual(out["logit"].shape, (2, 24, 1))
+
+    def test_tpc_input_validation_raises_type_error(self):
+        """Verifies that non-Tensor vitals input raises TypeError."""
+        model = TPC(continuous_dim=12, static_dim=0)
+        with self.assertRaises(TypeError):
+            model(vitals="invalid_type")
+
 
 class TestTPCTask(unittest.TestCase):
     """Unit tests for the LengthOfStayTPCeICU task pipeline and batching."""
@@ -611,6 +639,97 @@ class TestTPCTask(unittest.TestCase):
         sampler.reset()
         batches_ep0_replay = list(sampler)
         self.assertEqual(batches_ep0_replay, batches_ep0)
+
+    def test_map_dataset_lazy_indexing(self):
+        """Tests that MapDataset supports both eager lists and lazy index mapping."""
+        mock_data = [{"id": f"s_{i}"} for i in range(10)]
+
+        # Eager mode
+        ds_eager = MapDataset(mock_data)
+        self.assertEqual(len(ds_eager), 10)
+        self.assertEqual(ds_eager[0]["id"], "s_0")
+        self.assertEqual(ds_eager[9]["id"], "s_9")
+
+        # Lazy subset indexing mode
+        subset_indices = [2, 5, 8]
+        ds_lazy = MapDataset(mock_data, indices=subset_indices)
+        self.assertEqual(len(ds_lazy), 3)
+        self.assertEqual(ds_lazy[0]["id"], "s_2")
+        self.assertEqual(ds_lazy[1]["id"], "s_5")
+        self.assertEqual(ds_lazy[2]["id"], "s_8")
+
+    def test_load_eicu_vitals_cache_chunked_and_filtered(self):
+        """Tests that load_eicu_vitals_cache chunks and filters stays."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            p_prefix = (
+                "notes/Progress Notes/Physical Exam/Physical Exam/Vital Signs/"
+            )
+            csv_content = (
+                "patientunitstayid,physicalexamoffset,physicalexampath,"
+                "physicalexamtext\n"
+                f"stay_1,60,{p_prefix}HR/HR Current,80\n"
+                f"stay_2,120,{p_prefix}HR/HR Current,90\n"
+                f"stay_1,180,{p_prefix}HR/HR Current,85\n"
+                f"stay_3,240,{p_prefix}HR/HR Current,95\n"
+            )
+            pe_file = tmp_path / "physicalExam.csv"
+            pe_file.write_text(csv_content)
+
+            # Test chunksize=2 with filter on stay_1 only
+            vitals, _ = load_eicu_vitals_cache(
+                str(tmp_path), chunksize=2, valid_stay_ids={"stay_1"}
+            )
+
+            self.assertIn("stay_1", vitals)
+            self.assertNotIn("stay_2", vitals)
+            self.assertNotIn("stay_3", vitals)
+            self.assertEqual(len(vitals["stay_1"]), 2)
+            # Ordered chronologically: hour 1 (60m) then hour 3 (180m)
+            self.assertEqual(vitals["stay_1"][0], (1, "heart_rate", 80.0))
+            self.assertEqual(vitals["stay_1"][1], (3, "heart_rate", 85.0))
+
+    def test_get_valid_eicu_stay_ids(self):
+        """Tests get_valid_eicu_stay_ids filtering on adult and >=5h criteria."""
+        class MockPatientObj:
+            def __init__(self, sid, offset, age):
+                self.patientunitstayid = sid
+                self.unitdischargeoffset = offset
+                self.age = age
+
+        p_adult = type(
+            "P", (),
+            {"get_events": lambda self, event_type: [
+                MockPatientObj("stay_valid", 360, "55"),
+                MockPatientObj("stay_short", 120, "55"),
+                MockPatientObj("stay_child", 400, "16"),
+            ]}
+        )()
+        mock_ds = type("DS", (), {"iter_patients": lambda self: [p_adult]})()
+        valid_ids = get_valid_eicu_stay_ids(mock_ds)
+        self.assertEqual(valid_ids, {"stay_valid"})
+
+    def test_task_cache_fingerprint_decoupled(self):
+        """Tests that task keeps large dicts out of vars(task) for json.dumps."""
+        import json
+        large_vitals = {
+            f"stay_{i}": [(0, "heart_rate", 80.0)] for i in range(50)
+        }
+        task = LengthOfStayTask(vitals_by_stay=large_vitals)
+
+        # 1. vars(task) does not contain vitals_by_stay directly
+        v = vars(task)
+        self.assertNotIn("vitals_by_stay", v)
+        self.assertNotIn("baseline_static_by_stay", v)
+        self.assertIn("vitals_hash", v)
+
+        # 2. json.dumps is small and compact (< 2 KB)
+        dumped = json.dumps(v, default=str)
+        self.assertLess(len(dumped), 2048)
+
+        # 3. Transparent property access returns the full dictionary
+        self.assertEqual(len(task.vitals_by_stay), 50)
+        self.assertIn("stay_0", task.vitals_by_stay)
 
 
 if __name__ == "__main__":

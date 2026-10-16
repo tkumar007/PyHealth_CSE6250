@@ -39,6 +39,8 @@ from .length_of_stay_stagenet_mimic4 import LengthOfStayStageNetMIMIC4
 from .length_of_stay_tpc_eicu import (
     LengthOfStayPredictionTPCeICU as LengthOfStayPredictionTPCeICU,
     LengthOfStayTPCeICU as LengthOfStayTPCeICU,
+    get_valid_eicu_stay_ids as get_valid_eicu_stay_ids,
+    load_eicu_vitals_cache as load_eicu_vitals_cache,
 )
 from .medical_coding import MIMIC3ICD9Coding
 from .medical_transcriptions_classification import MedicalTranscriptionsClassification

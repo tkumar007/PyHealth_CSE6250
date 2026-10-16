@@ -31,9 +31,14 @@ Key Features:
 
 from __future__ import annotations
 
+import hashlib
+import math
 import os
-from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any, ClassVar
+import pickle
+import tempfile
+from collections.abc import Iterator, Sequence
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pyhealth.datasets import eICUDataset
@@ -44,6 +49,31 @@ import torch
 from torch.utils.data import Sampler
 
 from pyhealth.tasks.base_task import BaseTask
+
+# Global in-memory storage for large vitals caches decoupled from task __dict__
+_VITALS_MEM_CACHE: dict[str, dict[str, list[tuple[int, str, float]]]] = {}
+_BASELINE_MEM_CACHE: dict[str, dict[str, dict[str, float]]] = {}
+
+
+def _compute_cache_fingerprint(data: Any) -> str:
+    """Computes a deterministic lightweight SHA-256 fingerprint for caching."""
+    if data is None:
+        return "none"
+    if isinstance(data, (str, Path)):
+        p = str(data)
+        if os.path.exists(p):
+            stat = os.stat(p)
+            token = f"{p}:{stat.st_mtime}:{stat.st_size}"
+            return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+        return hashlib.sha256(p.encode("utf-8")).hexdigest()[:16]
+    if not isinstance(data, dict) or not data:
+        return "empty"
+    keys = sorted(data.keys())
+    sample = [keys[0], keys[len(keys) // 2], keys[-1]] if len(keys) > 3 else keys
+    sample_preview = [str(data[k])[:80] for k in sample]
+    token = f"len={len(data)};sample_keys={sample};sample_val={sample_preview}"
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
 
 # 6 Core Bedside Vital Signs extracted from physicalExam / vitalPeriodic
 CORE_VITALS_MAP = {
@@ -200,9 +230,56 @@ def select_qualifying_labs(
     return selected, True
 
 
+def get_valid_eicu_stay_ids(
+    dataset: Any,
+    min_stay_hours: float = 5.0,
+    min_age: float = 18.0,
+) -> set[str]:
+    """Extracts stay IDs from an eICU dataset matching adult & minimum LoS criteria.
+
+    Args:
+        dataset: eICUDataset or dataset with iter_patients().
+        min_stay_hours: Minimum ICU discharge offset in hours (default: 5.0).
+        min_age: Minimum patient age in years (default: 18.0).
+
+    Returns:
+        set[str]: Set of valid patientunitstayid strings.
+
+    Examples:
+        >>> from pyhealth.tasks.length_of_stay_tpc_eicu import get_valid_eicu_stay_ids
+        >>> valid_ids = get_valid_eicu_stay_ids(None)  # doctest: +SKIP
+    """
+    valid_ids: set[str] = set()
+    min_offset = min_stay_hours * 60.0
+    for patient in dataset.iter_patients():
+        for stay in patient.get_events(event_type="patient"):
+            sid = str(getattr(stay, "patientunitstayid", ""))
+            raw_offset = getattr(stay, "unitdischargeoffset", None)
+            if raw_offset is None:
+                continue
+            try:
+                offset = float(raw_offset)
+            except (ValueError, TypeError):
+                continue
+            if offset < min_offset:
+                continue
+            age_str = str(getattr(stay, "age", "63")).replace(">", "").strip()
+            try:
+                age = float(age_str)
+            except (ValueError, TypeError):
+                age = 63.0
+            if age <= min_age:
+                continue
+            valid_ids.add(sid)
+    return valid_ids
+
+
 def load_eicu_vitals_cache(
     eicu_root: str,
     dataset: eICUDataset | None = None,
+    chunksize: int = 250_000,
+    valid_stay_ids: set[str] | None = None,
+    output_path: str | Path | None = None,
 ) -> tuple[dict[str, list[tuple[int, str, float]]], dict[str, dict[str, float]]]:
     """Loads bedside vital signs and admission-window baseline measurements for eICU.
 
@@ -213,10 +290,15 @@ def load_eicu_vitals_cache(
     - Preserves legitimate zero/negative measurements.
     - Baseline measurements are restricted strictly to [-24h, +5h] relative to ICU.
     - If multiple baseline measurements exist in window, sorts by proximity to intime.
+    - Streams large CSV files in chunks (chunksize) to prevent out-of-memory errors
+      on full multi-gigabyte eICU releases (e.g. vitalPeriodic.csv > 15 GB).
 
     Args:
         eicu_root: Path to eICU directory containing CSV files.
         dataset: Optional eICUDataset instance for stay validation.
+        chunksize: Number of rows to process per chunk (default: 250,000).
+        valid_stay_ids: Optional set of ICU stay IDs to filter during ingestion.
+        output_path: Optional file path to persist parsed vitals cache on disk.
 
     Returns:
         tuple: (vitals_by_stay, baseline_static_by_stay) dictionaries mapping stay ID
@@ -226,8 +308,12 @@ def load_eicu_vitals_cache(
         >>> from pyhealth.tasks.length_of_stay_tpc_eicu import load_eicu_vitals_cache
         >>> vitals, baseline = load_eicu_vitals_cache("./data")  # doctest: +SKIP
     """
-    vitals_by_stay: dict[str, list[tuple[int, str, float]]] = {}
-    baseline_static_by_stay: dict[str, dict[str, float]] = {}
+    stay_filter: set[str] | None = None
+    if valid_stay_ids is not None:
+        stay_filter = set(valid_stay_ids)
+
+    vitals_raw: dict[str, list[tuple[float, int, str, float]]] = {}
+    baseline_best: dict[str, dict[str, tuple[float, float]]] = {}
 
     # 1. Check for physicalExam.csv in eicu_root
     pe_csv = os.path.join(eicu_root, "physicalExam.csv")
@@ -237,62 +323,72 @@ def load_eicu_vitals_cache(
     )
 
     if pe_path is not None:
-        df_pe = pd.read_csv(
+        pe_cols_set = {
+            "patientunitstayid",
+            "physicalexamoffset",
+            "physicalexampath",
+            "physicalexamtext",
+        }
+        # Chunked ingestion to handle multi-gigabyte tables without memory exhaustion
+        for chunk in pd.read_csv(
             pe_path,
-            usecols=[
-                "patientunitstayid",
-                "physicalexamoffset",
-                "physicalexampath",
-                "physicalexamtext",
-            ],
-        )
-        df_pe = df_pe[df_pe["physicalexamtext"].notnull()]
-        df_pe["offset"] = pd.to_numeric(
-            df_pe["physicalexamoffset"], errors="coerce"
-        )
-        df_pe = df_pe[df_pe["offset"].notnull()]
+            usecols=lambda c: str(c) in pe_cols_set,
+            chunksize=chunksize,
+        ):
+            chunk = chunk[chunk["physicalexamtext"].notnull()]
+            chunk["offset"] = pd.to_numeric(
+                chunk["physicalexamoffset"], errors="coerce"
+            )
+            chunk = chunk[chunk["offset"].notnull()]
+            if stay_filter is not None:
+                chunk = chunk[
+                    chunk["patientunitstayid"].astype(str).isin(stay_filter)
+                ]
 
-        # 1a. Continuous bedside vitals (sorted chronologically by offset)
-        df_vitals = df_pe[df_pe["offset"] >= 0].sort_values(by="offset")
-        for row in df_vitals.itertuples(index=False):
-            sid = str(row.patientunitstayid)
-            path = str(row.physicalexampath)
-            text = str(row.physicalexamtext)
-            hour = int(float(row.offset) // 60)
-            for sub, vkey in PHYSICAL_EXAM_VITALS_MAP.items():
-                if sub in path:
-                    try:
-                        val = float(text)
-                        if sid not in vitals_by_stay:
-                            vitals_by_stay[sid] = []
-                        vitals_by_stay[sid].append((hour, vkey, val))
-                    except (ValueError, TypeError):
-                        pass
-                    break
+            # 1a. Bedside vitals (offset >= 0)
+            df_vitals = chunk[chunk["offset"] >= 0]
+            for row in df_vitals.itertuples(index=False):
+                sid = str(row.patientunitstayid)
+                path = str(row.physicalexampath)
+                text = str(row.physicalexamtext)
+                off = float(row.offset)
+                hour = int(off // 60)
+                for sub, vkey in PHYSICAL_EXAM_VITALS_MAP.items():
+                    if sub in path:
+                        try:
+                            val = float(text)
+                            if sid not in vitals_raw:
+                                vitals_raw[sid] = []
+                            vitals_raw[sid].append((off, hour, vkey, val))
+                        except (ValueError, TypeError):
+                            pass
+                        break
 
-        # 1b. Baseline measurements restricted strictly to [-24h, +5h] = [-1440m, +300m]
-        # Sorted by absolute distance to admission intime (offset=0)
-        df_windowed = df_pe[
-            (df_pe["offset"] >= -1440.0) & (df_pe["offset"] <= 300.0)
-        ].copy()
-        df_windowed["abs_offset"] = df_windowed["offset"].abs()
-        df_windowed.sort_values(by="abs_offset", inplace=True)
-
-        for row in df_windowed.itertuples(index=False):
-            sid = str(row.patientunitstayid)
-            path = str(row.physicalexampath)
-            text = str(row.physicalexamtext)
-            for sub, gkey in BASELINE_GCS_MAP.items():
-                if sub in path:
-                    try:
-                        val = float(text)
-                        if sid not in baseline_static_by_stay:
-                            baseline_static_by_stay[sid] = {}
-                        if gkey not in baseline_static_by_stay[sid]:
-                            baseline_static_by_stay[sid][gkey] = val
-                    except (ValueError, TypeError):
-                        pass
-                    break
+            # 1b. Baseline measurements in window [-24h, +5h] = [-1440m, +300m]
+            # Track observation with minimum abs(offset) relative to ICU
+            # admission (offset=0)
+            df_windowed = chunk[
+                (chunk["offset"] >= -1440.0) & (chunk["offset"] <= 300.0)
+            ]
+            for row in df_windowed.itertuples(index=False):
+                sid = str(row.patientunitstayid)
+                path = str(row.physicalexampath)
+                text = str(row.physicalexamtext)
+                abs_off = abs(float(row.offset))
+                for sub, gkey in BASELINE_GCS_MAP.items():
+                    if sub in path:
+                        try:
+                            val = float(text)
+                            if sid not in baseline_best:
+                                baseline_best[sid] = {}
+                            if (
+                                gkey not in baseline_best[sid]
+                                or abs_off < baseline_best[sid][gkey][0]
+                            ):
+                                baseline_best[sid][gkey] = (abs_off, val)
+                        except (ValueError, TypeError):
+                            pass
+                        break
 
     # 2. Check for optional vitalPeriodic.csv / vitalPeriodic.csv.gz
     vp_csv = os.path.join(eicu_root, "vitalPeriodic.csv")
@@ -303,39 +399,100 @@ def load_eicu_vitals_cache(
 
     if vp_path is not None:
         try:
-            df_vp = pd.read_csv(vp_path)
-            if "observationoffset" in df_vp.columns:
-                df_vp.sort_values(by="observationoffset", inplace=True)
-                col_map = {
-                    "heartrate": "heart_rate",
-                    "systemicsystolic": "systolic_bp",
-                    "systemicdiastolic": "diastolic_bp",
-                    "respiration": "respiration_rate",
-                    "sao2": "spo2",
-                    "temperature": "temperature",
-                }
-                for row in df_vp.itertuples(index=False):
-                    sid = str(getattr(row, "patientunitstayid", ""))
-                    off = float(getattr(row, "observationoffset", 0.0))
-                    if off < 0:
-                        continue
-                    hour = int(off // 60)
-                    if sid not in vitals_by_stay:
-                        vitals_by_stay[sid] = []
-                    for c_name, vkey in col_map.items():
-                        if hasattr(row, c_name):
-                            c_val = getattr(row, c_name)
-                            if pd.notnull(c_val):
-                                try:
-                                    vitals_by_stay[sid].append(
-                                        (hour, vkey, float(c_val))
-                                    )
-                                except (ValueError, TypeError):
-                                    pass
+            col_map = {
+                "heartrate": "heart_rate",
+                "systemicsystolic": "systolic_bp",
+                "systemicdiastolic": "diastolic_bp",
+                "respiration": "respiration_rate",
+                "sao2": "spo2",
+                "temperature": "temperature",
+            }
+            # Inspect column headers without reading rows
+            header_cols = [
+                c.lower() for c in pd.read_csv(vp_path, nrows=0).columns
+            ]
+            available_cols = [
+                c
+                for c in ["patientunitstayid", "observationoffset"]
+                + list(col_map.keys())
+                if c in header_cols
+            ]
+            if (
+                "patientunitstayid" in available_cols
+                and "observationoffset" in available_cols
+            ):
+                available_set = set(available_cols)
+                for chunk in pd.read_csv(
+                    vp_path,
+                    usecols=lambda c: str(c) in available_set,
+                    chunksize=chunksize,
+                ):
+                    chunk.columns = chunk.columns.str.lower()
+                    if stay_filter is not None:
+                        chunk = chunk[
+                            chunk["patientunitstayid"]
+                            .astype(str)
+                            .isin(stay_filter)
+                        ]
+                    chunk["observationoffset"] = pd.to_numeric(
+                        chunk["observationoffset"], errors="coerce"
+                    )
+                    chunk = chunk[
+                        chunk["observationoffset"].notnull()
+                        & (chunk["observationoffset"] >= 0)
+                    ]
+                    for row in chunk.itertuples(index=False):
+                        sid = str(getattr(row, "patientunitstayid", ""))
+                        off = float(getattr(row, "observationoffset", 0.0))
+                        hour = int(off // 60)
+                        if sid not in vitals_raw:
+                            vitals_raw[sid] = []
+                        for c_name, vkey in col_map.items():
+                            if hasattr(row, c_name):
+                                c_val = getattr(row, c_name)
+                                if pd.notnull(c_val):
+                                    try:
+                                        vitals_raw[sid].append(
+                                            (off, hour, vkey, float(c_val))
+                                        )
+                                    except (ValueError, TypeError):
+                                        pass
         except (OSError, ValueError):
             pass
 
+    # Sort each stay's vitals chronologically by observation offset
+    vitals_by_stay: dict[str, list[tuple[int, str, float]]] = {}
+    for sid, records in vitals_raw.items():
+        records.sort(key=lambda r: r[0])
+        vitals_by_stay[sid] = [(r[1], r[2], r[3]) for r in records]
+
+    baseline_static_by_stay: dict[str, dict[str, float]] = {
+        sid: {gkey: best[1] for gkey, best in feats.items()}
+        for sid, feats in baseline_best.items()
+    }
+
+    if output_path is not None:
+        out_p = Path(output_path)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_p, "wb") as f:
+            pickle.dump((vitals_by_stay, baseline_static_by_stay), f)
+
     return vitals_by_stay, baseline_static_by_stay
+
+
+def _percentile(data: list[float], q: float) -> float:
+    """Computes the q-th percentile (0-100) using linear interpolation."""
+    s = sorted(data)
+    n = len(s)
+    if n == 1:
+        return s[0]
+    idx = (q / 100.0) * (n - 1)
+    low = math.floor(idx)
+    high = math.ceil(idx)
+    if low == high:
+        return s[low]
+    weight = idx - low
+    return s[low] * (1.0 - weight) + s[high] * weight
 
 
 def compute_empirical_training_stats(
@@ -513,8 +670,9 @@ def compute_empirical_training_stats(
         vals = ts_vals.get(item_id, [])
         ts_counts[item_id] = len(vals)
         if len(vals) > 0:
-            arr = np.array(vals)
-            p1, p99 = np.percentile(arr, 1), np.percentile(arr, 99)
+            arr = np.asarray(vals, dtype=np.float64)
+            p1 = float(np.percentile(arr, 1.0))
+            p99 = float(np.percentile(arr, 99.0))
             clipped = np.clip(arr, p1, p99)
             mean = float(np.mean(clipped))
             std = float(np.std(clipped))
@@ -535,7 +693,7 @@ def compute_empirical_training_stats(
     for k, prior in default_priors.items():
         vals = continuous_static_vals.get(k, [])
         if len(vals) > 0:
-            arr = np.array(vals)
+            arr = np.asarray(vals, dtype=np.float64)
             mean = float(np.mean(arr))
             std = float(np.std(arr))
             median = float(np.median(arr))
@@ -635,14 +793,14 @@ class LengthOfStayTPCeICU(BaseTask):
         >>> sample_dataset = dataset.set_task(task)  # doctest: +SKIP
     """
 
-    task_name: ClassVar[str] = "eICU Remaining Length of Stay Prediction (TPC)"
-    input_schema: ClassVar[dict[str, str]] = {
+    task_name: str = "eICU Remaining Length of Stay Prediction (TPC)"
+    input_schema: dict[str, str | type] = {  # noqa: RUF012
         "vitals": "tensor",
         "vitals_decay": "tensor",
         "static": "tensor",
         "mask": "tensor",
     }
-    output_schema: ClassVar[dict[str, str]] = {
+    output_schema: dict[str, str | type] = {  # noqa: RUF012
         "los": "tensor",
         "mortality": "tensor",
     }
@@ -651,8 +809,14 @@ class LengthOfStayTPCeICU(BaseTask):
         self,
         lab_names: list[str] | None = None,
         norm_stats: dict[str, tuple[float, float]] | None = None,
-        vitals_by_stay: dict[str, list[tuple[int, str, float]]] | None = None,
-        baseline_static_by_stay: dict[str, dict[str, float]] | None = None,
+        vitals_by_stay: dict[str, list[tuple[int, str, float]]]
+        | str
+        | Path
+        | None = None,
+        baseline_static_by_stay: dict[str, dict[str, float]]
+        | str
+        | Path
+        | None = None,
         static_stats: dict[str, tuple[float, float, float]] | None = None,
         cat_vocabs: dict[str, list[str]] | None = None,
         max_stay_hours: int = 336,
@@ -661,10 +825,37 @@ class LengthOfStayTPCeICU(BaseTask):
         self.lab_names = (
             lab_names if lab_names is not None else DEFAULT_LAB_NAMES
         )
-        self.vitals_by_stay = vitals_by_stay or {}
-        self.baseline_static_by_stay = baseline_static_by_stay or {}
         self.norm_stats = norm_stats or {}
         self.max_stay_hours = max_stay_hours
+
+        # Fingerprint and decouple large vitals caches outside __dict__ to prevent
+        # BaseDataset.set_task from stringifying multi-gigabyte dicts into JSON.
+        self.vitals_cache_path: str | None = None
+        self.baseline_cache_path: str | None = None
+
+        if isinstance(vitals_by_stay, (str, Path)):
+            self.vitals_cache_path = str(vitals_by_stay)
+            self.vitals_hash = _compute_cache_fingerprint(vitals_by_stay)
+            self.vitals_count = -1
+        else:
+            v_dict = vitals_by_stay or {}
+            self.vitals_hash = _compute_cache_fingerprint(v_dict)
+            self.vitals_count = len(v_dict)
+            if self.vitals_hash != "empty":
+                _VITALS_MEM_CACHE[self.vitals_hash] = v_dict
+
+        if isinstance(baseline_static_by_stay, (str, Path)):
+            self.baseline_cache_path = str(baseline_static_by_stay)
+            self.baseline_hash = _compute_cache_fingerprint(
+                baseline_static_by_stay
+            )
+            self.baseline_count = -1
+        else:
+            b_dict = baseline_static_by_stay or {}
+            self.baseline_hash = _compute_cache_fingerprint(b_dict)
+            self.baseline_count = len(b_dict)
+            if self.baseline_hash != "empty":
+                _BASELINE_MEM_CACHE[self.baseline_hash] = b_dict
 
         # Construct time-series feature mapping
         self.vital_keys = (
@@ -709,6 +900,67 @@ class LengthOfStayTPCeICU(BaseTask):
         self.static_dim = 11 + sum(
             len(vocab) + 1 for vocab in self.cat_vocabs.values()
         )
+
+    @property
+    def vitals_by_stay(self) -> dict[str, list[tuple[int, str, float]]]:
+        """Bedside vitals cache mapping stay ID to vital sign tuples."""
+        if self.vitals_hash in _VITALS_MEM_CACHE:
+            return _VITALS_MEM_CACHE[self.vitals_hash]
+        if self.vitals_cache_path and os.path.exists(self.vitals_cache_path):
+            with open(self.vitals_cache_path, "rb") as f:
+                loaded = pickle.load(f)
+                if isinstance(loaded, tuple) and len(loaded) == 2:
+                    loaded = loaded[0]
+                _VITALS_MEM_CACHE[self.vitals_hash] = loaded
+                return loaded
+        return {}
+
+    @property
+    def baseline_static_by_stay(self) -> dict[str, dict[str, float]]:
+        """Baseline static admissions cache mapping stay ID to measurements."""
+        if self.baseline_hash in _BASELINE_MEM_CACHE:
+            return _BASELINE_MEM_CACHE[self.baseline_hash]
+        if self.baseline_cache_path and os.path.exists(self.baseline_cache_path):
+            with open(self.baseline_cache_path, "rb") as f:
+                loaded = pickle.load(f)
+                if isinstance(loaded, tuple) and len(loaded) == 2:
+                    loaded = loaded[1]
+                _BASELINE_MEM_CACHE[self.baseline_hash] = loaded
+                return loaded
+        return {}
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Prepares state for pickling across worker processes."""
+        state = self.__dict__.copy()
+        if (
+            not state.get("vitals_cache_path")
+            and self.vitals_hash in _VITALS_MEM_CACHE
+        ):
+            tmp_path = os.path.join(
+                tempfile.gettempdir(),
+                f"pyhealth_vitals_{self.vitals_hash}.pkl",
+            )
+            if not os.path.exists(tmp_path):
+                with open(tmp_path, "wb") as f:
+                    pickle.dump(_VITALS_MEM_CACHE[self.vitals_hash], f)
+            state["vitals_cache_path"] = tmp_path
+        if (
+            not state.get("baseline_cache_path")
+            and self.baseline_hash in _BASELINE_MEM_CACHE
+        ):
+            tmp_path = os.path.join(
+                tempfile.gettempdir(),
+                f"pyhealth_baseline_{self.baseline_hash}.pkl",
+            )
+            if not os.path.exists(tmp_path):
+                with open(tmp_path, "wb") as f:
+                    pickle.dump(_BASELINE_MEM_CACHE[self.baseline_hash], f)
+            state["baseline_cache_path"] = tmp_path
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Restores state upon unpickling."""
+        self.__dict__.update(state)
 
     @staticmethod
     def _one_hot(val: str, vocab: list[str]) -> list[float]:
@@ -979,37 +1231,59 @@ LengthOfStayPredictionTPCeICU = LengthOfStayTPCeICU
 
 
 class MapDataset(torch.utils.data.Dataset):
-    """In-memory map-style dataset enabling custom BatchSampler and length bucketing.
+    """Map-style dataset enabling custom BatchSampler and length bucketing.
+
+    Supports both in-memory sample lists and lazy subset indexing into an underlying
+    streaming dataset (e.g., SampleDataset), preventing OOM on multi-gigabyte cohorts.
 
     Examples:
         >>> from pyhealth.tasks.length_of_stay_tpc_eicu import MapDataset
         >>> ds = MapDataset([{"patient_id": "p1"}, {"patient_id": "p2"}])
         >>> len(ds)
         2
+        >>> ds[0]["patient_id"]
+        'p1'
+        >>> ds_indexed = MapDataset(
+        ...     [{"patient_id": "p1"}, {"patient_id": "p2"}], indices=[1]
+        ... )
+        >>> len(ds_indexed)
+        1
+        >>> ds_indexed[0]["patient_id"]
+        'p2'
     """
 
-    def __init__(self, samples: list[dict]):
+    def __init__(
+        self,
+        samples: Any,
+        indices: Sequence[int] | None = None,
+    ):
         """Initializes MapDataset.
 
         Args:
-            samples: List of sample dictionaries.
+            samples: List of sample dictionaries or an underlying Dataset.
+            indices: Optional sequence of indices for lazy subset indexing.
         """
         self.samples = samples
+        self.indices = list(indices) if indices is not None else None
 
     def __len__(self) -> int:
         """Returns total number of samples."""
+        if self.indices is not None:
+            return len(self.indices)
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> dict:
+    def __getitem__(self, index: int) -> dict:
         """Retrieves a sample dictionary by index.
 
         Args:
-            idx: Index of sample.
+            index: Index of sample.
 
         Returns:
             dict: Sample dictionary.
         """
-        return self.samples[idx]
+        if self.indices is not None:
+            return self.samples[self.indices[index]]
+        return self.samples[index]
 
 
 class BucketBatchSampler(Sampler[list[int]]):
@@ -1055,14 +1329,14 @@ class BucketBatchSampler(Sampler[list[int]]):
 
     def __iter__(self) -> Iterator[list[int]]:
         """Yields mini-batch index lists grouped by sequence length."""
-        indices = np.argsort(self.lengths)
+        indices = [int(idx) for idx in np.argsort(self.lengths)]
         batches = [
-            indices[i : i + self.batch_size].tolist()
+            indices[i : i + self.batch_size]
             for i in range(0, len(indices), self.batch_size)
         ]
         if self.shuffle:
             rng = np.random.default_rng(self.seed + self.epoch)
-            perm = rng.permutation(len(batches))
+            perm = [int(p) for p in rng.permutation(len(batches))]
             batches = [batches[i] for i in perm]
         self.epoch += 1
         yield from batches

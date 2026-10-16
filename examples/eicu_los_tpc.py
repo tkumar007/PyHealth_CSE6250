@@ -78,12 +78,10 @@ from pyhealth.tasks.length_of_stay_tpc_eicu import (
     BucketBatchSampler,
     MapDataset,
     compute_empirical_training_stats,
+    get_valid_eicu_stay_ids,
     load_eicu_vitals_cache,
     select_qualifying_labs,
 )
-
-# Retain alias for compatibility
-LengthOfStayTask = LengthOfStayTPCeICU
 
 
 class AblationConfig(TypedDict):
@@ -140,12 +138,14 @@ def run_ablation_study(
 
     def evaluate_loader(
         model: TPC, loader: DataLoader
-    ) -> tuple[float, float, float]:
+    ) -> tuple[float, float, float, float]:
         model.eval()
         sum_msle = 0.0
         sum_mse = 0.0
         sum_mae = 0.0
+        sum_mort_bce = 0.0
         total_valid_hours = 0
+        total_mort_batches = 0
 
         with torch.no_grad():
             for batch in loader:
@@ -183,10 +183,32 @@ def run_ablation_study(
                     sum_mse += torch.sum((yp - yt) ** 2).item()
                     sum_mae += torch.sum(torch.abs(yp - yt)).item()
 
+                if (
+                    model.multitask
+                    and "mortality_prob" in out
+                    and "mortality" in batch
+                ):
+                    raw_mort = (
+                        batch["mortality"]
+                        .float()
+                        .view(-1, 1, 1)
+                        .expand_as(out["mortality_prob"])
+                    )
+                    m_eval = (m if T > 4 else mask).unsqueeze(-1)
+                    if m_eval.sum() > 0:
+                        mort_loss = torch.nn.functional.binary_cross_entropy(
+                            out["mortality_prob"][m_eval],
+                            raw_mort[m_eval],
+                        ).item()
+                        sum_mort_bce += mort_loss
+                        total_mort_batches += 1
+
+        avg_mort = sum_mort_bce / max(total_mort_batches, 1)
         return (
             sum_msle / max(total_valid_hours, 1),
             sum_mse / max(total_valid_hours, 1),
             sum_mae / max(total_valid_hours, 1),
+            avg_mort,
         )
 
     results = []
@@ -214,6 +236,7 @@ def run_ablation_study(
             min_time=4,
             floor_days=LOS_FLOOR_DAYS,
             use_decay=cfg["use_decay"],
+            multitask=True,
         )
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
@@ -225,8 +248,10 @@ def run_ablation_study(
                 out["loss"].backward()
                 optimizer.step()
 
-        val_msle, _, _ = evaluate_loader(model, val_loader)
-        test_msle, test_mse, test_mae = evaluate_loader(model, test_loader)
+        val_msle, _, _, _ = evaluate_loader(model, val_loader)
+        test_msle, test_mse, test_mae, test_mort = evaluate_loader(
+            model, test_loader
+        )
 
         results.append(
             {
@@ -235,26 +260,27 @@ def run_ablation_study(
                 "Test MSLE": test_msle,
                 "Test MSE": test_mse,
                 "Test MAE": test_mae,
+                "Test Mort BCE": test_mort,
             }
         )
 
-    print("\n" + "=" * 85)
+    print("\n" + "=" * 98)
     print(
         "HELD-OUT TEST ABLATION STUDY RESULTS "
         "(eICU, 2 epochs – pipeline check only):"
     )
     print(
-        f"{'Configuration':<32} | {'Val MSLE':<10} | {'Test MSLE':<10} | "
-        f"{'Test MSE':<10} | {'Test MAE':<10}"
+        f"{'Configuration':<26} | {'Val MSLE':<10} | {'Test MSLE':<10} | "
+        f"{'Test MSE':<10} | {'Test MAE':<10} | {'Test Mort BCE':<13}"
     )
-    print("-" * 85)
+    print("-" * 98)
     for r in results:
         print(
-            f"{r['Configuration']:<32} | {r['Val MSLE']:<10.4f} | "
+            f"{r['Configuration']:<26} | {r['Val MSLE']:<10.4f} | "
             f"{r['Test MSLE']:<10.4f} | {r['Test MSE']:<10.4f} | "
-            f"{r['Test MAE']:<10.4f}"
+            f"{r['Test MAE']:<10.4f} | {r['Test Mort BCE']:<13.4f}"
         )
-    print("=" * 85)
+    print("=" * 98)
 
 
 if __name__ == "__main__":
@@ -270,6 +296,15 @@ if __name__ == "__main__":
             "(default: ./test-resources/core/eicudemo)"
         ),
     )
+    parser.add_argument(
+        "--chunksize",
+        type=int,
+        default=250000,
+        help=(
+            "Chunk size (number of rows) for reading large CSVs "
+            "(default: 250000)"
+        ),
+    )
     args = parser.parse_args()
 
     eicu_root = args.data_dir
@@ -279,7 +314,7 @@ if __name__ == "__main__":
     print("1. Initializing eICUDataset...")
     dataset = eICUDataset(
         root=eicu_root,
-        tables=["lab", "physicalexam", "diagnosis"],
+        tables=["patient", "lab"],
     )
 
     # Partition patients strictly BEFORE task processing to prevent any data leakage
@@ -303,8 +338,13 @@ if __name__ == "__main__":
         "\n3. Loading bedside vital signs & admission baseline items "
         "from physicalExam..."
     )
+    valid_stay_ids = get_valid_eicu_stay_ids(dataset)
+    print(f"  Identified {len(valid_stay_ids)} adult ICU stays (>= 5h).")
     vitals_by_stay, baseline_static_by_stay = load_eicu_vitals_cache(
-        eicu_root, dataset
+        eicu_root,
+        dataset,
+        chunksize=args.chunksize,
+        valid_stay_ids=valid_stay_ids,
     )
     print(
         f"  Loaded vitals for {len(vitals_by_stay)} stays, "
@@ -360,7 +400,7 @@ if __name__ == "__main__":
         "\n6. Applying ICU Length of Stay Task "
         "(Multi-Modal Time Series + Static Features)..."
     )
-    task = LengthOfStayTask(
+    task = LengthOfStayTPCeICU(
         lab_names=qualifying_labs,
         norm_stats=emp_stats,
         vitals_by_stay=vitals_by_stay,
@@ -404,32 +444,33 @@ if __name__ == "__main__":
         test_indices = list(
             chain(*[p2idx[pid] for pid in test_pids if pid in p2idx])
         )
-        train_samples = [sample_dataset[i] for i in train_indices]
-        val_samples = [sample_dataset[i] for i in val_indices]
-        test_samples = [sample_dataset[i] for i in test_indices]
         print(
-            f"  Train stays: {len(train_samples)}, "
-            f"Val stays: {len(val_samples)}, "
-            f"Test stays: {len(test_samples)}"
+            f"  Train stays: {len(train_indices)}, "
+            f"Val stays: {len(val_indices)}, "
+            f"Test stays: {len(test_indices)}"
         )
 
-        train_lengths = [s["vitals"].shape[0] for s in train_samples]
+        # Sequence lengths for bucket batching without materializing
+        # all tensors into RAM
+        train_lengths = [
+            sample_dataset[i]["vitals"].shape[0] for i in train_indices
+        ]
         train_sampler = BucketBatchSampler(
             train_lengths, batch_size=4, shuffle=True, seed=42
         )
         train_loader = DataLoader(
-            MapDataset(train_samples),
+            MapDataset(sample_dataset, train_indices),
             batch_sampler=train_sampler,
             collate_fn=collate_fn_dict_with_padding,
         )
         val_loader = DataLoader(
-            MapDataset(val_samples),
+            MapDataset(sample_dataset, val_indices),
             batch_size=4,
             shuffle=False,
             collate_fn=collate_fn_dict_with_padding,
         )
         test_loader = DataLoader(
-            MapDataset(test_samples),
+            MapDataset(sample_dataset, test_indices),
             batch_size=4,
             shuffle=False,
             collate_fn=collate_fn_dict_with_padding,

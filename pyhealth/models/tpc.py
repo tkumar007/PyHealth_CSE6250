@@ -9,11 +9,19 @@ Description: Temporal Pointwise Convolution (TPC) model and TPCBlock architectur
 
 from __future__ import annotations
 
+import logging
+from typing import TYPE_CHECKING, cast
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from pyhealth.models import BaseModel
+
+if TYPE_CHECKING:
+    from pyhealth.datasets import SampleDataset
+
+logger = logging.getLogger(__name__)
 
 
 class TPCBlock(nn.Module):
@@ -171,18 +179,21 @@ class TPCBlock(nn.Module):
 class TPC(BaseModel):
     """Temporal Pointwise Convolution (TPC) model for ICU LoS prediction.
 
-    Faithfully reproduces the architecture from:
+    Adapted from the architecture described in:
     'Temporal Pointwise Convolutional Networks for Length of Stay Prediction
     in the Intensive Care Unit'
     (Emma Rocheteau, Pietro Liò, & Stephanie Hyland, ACM CHIL 2021).
 
     Args:
-        dataset: The PyHealth dataset.
+        dataset: Optional PyHealth SampleDataset. If provided and feature dims
+            are not specified, continuous_dim and static_dim are inferred.
         feature_keys: List of input feature keys (e.g. ['vitals', 'static']).
         label_key: Target key (defaults to 'los').
         mode: Prediction mode ('regression').
-        continuous_dim (int): Number of time series features (F). Default: 12.
-        static_dim (int): Number of static features (S). Default: 0.
+        continuous_dim (int | None): Number of time series features (F).
+            Inferred from dataset if None, or defaults to 12.
+        static_dim (int | None): Number of static baseline features (S).
+            Inferred from dataset if None, or defaults to 0.
         n_layers (int): Number of stacked TPC blocks (N). Default: 3.
         temp_dim (int): Temporal output channels per feature (Y). Default: 8.
         point_dim (int): Pointwise output channels (Z). Default: 16.
@@ -226,12 +237,12 @@ class TPC(BaseModel):
 
     def __init__(
         self,
-        dataset,
+        dataset: SampleDataset | None = None,
         feature_keys: list[str] | None = None,
         label_key: str | None = None,
         mode: str | None = None,
-        continuous_dim: int = 12,
-        static_dim: int = 0,
+        continuous_dim: int | None = None,
+        static_dim: int | None = None,
         n_layers: int = 3,
         temp_dim: int = 8,
         point_dim: int = 16,
@@ -246,11 +257,36 @@ class TPC(BaseModel):
         alpha: float = 0.5,
         **kwargs,
     ):
-        super().__init__(dataset=dataset, **kwargs)
+        super().__init__(dataset=cast("SampleDataset", dataset), **kwargs)
         self.label_key = label_key or (
             self.label_keys[0] if getattr(self, "label_keys", None) else "los"
         )
         self.mode = mode or "regression"
+
+        # Infer input dimensions from dataset if provided and not explicitly given
+        if dataset is not None:
+            try:
+                sample0 = dataset[0]
+                if continuous_dim is None and "vitals" in sample0:
+                    v = sample0["vitals"]
+                    continuous_dim = (
+                        v.shape[-1] if hasattr(v, "shape") else len(v[0])
+                    )
+                if static_dim is None and "static" in sample0:
+                    s = sample0["static"]
+                    static_dim = (
+                        s.shape[-1] if hasattr(s, "shape") else len(s)
+                    )
+            except (AttributeError, IndexError, KeyError, TypeError):
+                logger.debug(
+                    "Could not automatically infer feature dimensions "
+                    "from dataset."
+                )
+
+        if continuous_dim is None:
+            continuous_dim = 12
+        if static_dim is None:
+            static_dim = 0
 
         self.continuous_dim = continuous_dim
         self.static_dim = static_dim
@@ -380,9 +416,11 @@ class TPC(BaseModel):
         """
         # 1. Extract and validate vitals
         raw_vitals = kwargs.get("vitals")
-        assert isinstance(
-            raw_vitals, torch.Tensor
-        ), "vitals is missing or not a Tensor"
+        if not isinstance(raw_vitals, torch.Tensor):
+            raise TypeError(
+                f"Expected 'vitals' to be a torch.Tensor, but got "
+                f"{type(raw_vitals).__name__}"
+            )
 
         # Ensure vitals has shape (batch_size, seq_len, continuous_dim)
         vitals_tensor = (
@@ -467,6 +505,7 @@ class TPC(BaseModel):
 
         result: dict[str, torch.Tensor] = {
             "y_prob": y_prob,
+            "logit": los_out,
         }
 
         # 6. Loss Calculation
@@ -485,6 +524,7 @@ class TPC(BaseModel):
             if self.multitask and hasattr(self, "mort_fc"):
                 mort_out = self.mort_fc(feat).transpose(1, 2)  # (B, T, 1) logits
                 result["mortality_prob"] = torch.sigmoid(mort_out)
+                result["mortality_logit"] = mort_out
 
                 raw_mort = kwargs.get("mortality")
                 if raw_mort is None:
@@ -522,5 +562,6 @@ class TPC(BaseModel):
         elif self.multitask and hasattr(self, "mort_fc"):
             mort_out = self.mort_fc(feat).transpose(1, 2)
             result["mortality_prob"] = torch.sigmoid(mort_out)
+            result["mortality_logit"] = mort_out
 
         return result
