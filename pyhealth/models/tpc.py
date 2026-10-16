@@ -10,7 +10,7 @@ Description: Temporal Pointwise Convolution (TPC) model and TPCBlock architectur
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -237,7 +237,7 @@ class TPC(BaseModel):
 
     def __init__(
         self,
-        dataset: SampleDataset | None = None,
+        dataset: Any = None,
         feature_keys: list[str] | None = None,
         label_key: str | None = None,
         mode: str | None = None,
@@ -358,14 +358,33 @@ class TPC(BaseModel):
             y_true = y_true.view(-1, 1, 1)
         elif y_true.dim() == 2:
             y_true = y_true.unsqueeze(-1) if y_pred.dim() == 3 else y_true
+        elif (
+            y_true.dim() == 3
+            and y_true.shape[1] == 1
+            and y_true.shape[2] == y_pred.shape[1]
+        ):
+            y_true = y_true.transpose(1, 2)
 
         T = y_pred.shape[1]
+        if y_true.shape[1] == 1 and T > 1:
+            y_true = y_true.expand(-1, T, -1)
 
         # Build valid time mask (excludes zero padding and warmup hours t < min_time)
         if mask is not None:
-            valid_mask = mask.bool()
-            if valid_mask.dim() == 2:
-                valid_mask = valid_mask.unsqueeze(-1)
+            valid_mask = mask.to(device=y_pred.device).bool()
+            if valid_mask.dim() == 1:
+                valid_mask = valid_mask.view(-1, 1, 1).expand(-1, T, 1)
+            elif valid_mask.dim() == 2:
+                if valid_mask.shape[1] == T:
+                    valid_mask = valid_mask.unsqueeze(-1)
+                else:
+                    valid_mask = valid_mask.unsqueeze(-1).expand(-1, T, 1)
+            elif (
+                valid_mask.dim() == 3
+                and valid_mask.shape[1] == 1
+                and valid_mask.shape[2] == T
+            ):
+                valid_mask = valid_mask.transpose(1, 2)
         else:
             valid_mask = y_true > 0.0
 
@@ -427,18 +446,19 @@ class TPC(BaseModel):
             raw_vitals if raw_vitals.dim() == 3 else raw_vitals.unsqueeze(1)
         )
         B, T, _ = vitals_tensor.shape
+        device = vitals_tensor.device
 
         # 2. Extract or compute decay indicators: 0.75^j (if use_decay is enabled)
         x_raw = vitals_tensor.transpose(1, 2).float()
         if self.use_decay:
             raw_decay = kwargs.get("vitals_decay")
             if isinstance(raw_decay, torch.Tensor):
-                vitals_decay = raw_decay
+                vitals_decay = raw_decay.to(device=device, dtype=torch.float32)
             else:
                 raw_time_delta = kwargs.get("vitals_time_delta")
                 if isinstance(raw_time_delta, torch.Tensor):
                     vitals_decay = torch.pow(
-                        0.75, torch.clamp(raw_time_delta, min=0.0)
+                        0.75, torch.clamp(raw_time_delta.to(device=device), min=0.0)
                     )
                 else:
                     vitals_decay = torch.ones_like(vitals_tensor)
@@ -458,9 +478,11 @@ class TPC(BaseModel):
         s_expanded: torch.Tensor | None = None
         if self.static_dim > 0:
             if isinstance(raw_static, torch.Tensor):
-                s_tensor = raw_static.float()
+                s_tensor = raw_static.to(device=device, dtype=torch.float32)
                 if s_tensor.dim() == 1:
-                    s_tensor = s_tensor.unsqueeze(0)
+                    s_tensor = s_tensor.unsqueeze(0).expand(B, -1)
+                elif s_tensor.shape[0] == 1 and B > 1:
+                    s_tensor = s_tensor.expand(B, -1)
                 if s_tensor.shape[1] < self.static_dim:
                     s_tensor = F.pad(
                         s_tensor, (0, self.static_dim - s_tensor.shape[1])
@@ -470,7 +492,7 @@ class TPC(BaseModel):
                 s_expanded = s_tensor.unsqueeze(-1).expand(-1, -1, T)
             else:
                 s_expanded = torch.zeros(
-                    B, self.static_dim, T, device=vitals_tensor.device
+                    B, self.static_dim, T, device=device
                 )
 
         # 4. Pass through stacked TPC blocks
@@ -501,7 +523,9 @@ class TPC(BaseModel):
         y_prob = F.softplus(los_out) + self.floor_days  # (B, T, 1)
 
         raw_mask = kwargs.get("mask")
-        mask_tensor = raw_mask if isinstance(raw_mask, torch.Tensor) else None
+        mask_tensor = (
+            raw_mask.to(device=device) if isinstance(raw_mask, torch.Tensor) else None
+        )
 
         result: dict[str, torch.Tensor] = {
             "y_prob": y_prob,
@@ -514,7 +538,7 @@ class TPC(BaseModel):
             raw_y_true = kwargs.get("y_true")
 
         if isinstance(raw_y_true, torch.Tensor):
-            y_true_tensor = raw_y_true.float()
+            y_true_tensor = raw_y_true.to(device=device, dtype=torch.float32)
             result["y_true"] = y_true_tensor
             result["loss"] = self._compute_loss(
                 y_prob, y_true_tensor, mask=mask_tensor
@@ -529,12 +553,48 @@ class TPC(BaseModel):
                 raw_mort = kwargs.get("mortality")
                 if raw_mort is None:
                     raw_mort = kwargs.get("in_hospital_mortality")
+                if raw_mort is None:
+                    raw_mort = kwargs.get("mortality_label")
                 if isinstance(raw_mort, torch.Tensor):
-                    mort_true = (
-                        raw_mort.float().view(-1, 1, 1).expand_as(mort_out)
-                    )
+                    mort_t = raw_mort.to(device=device, dtype=torch.float32)
+                    if mort_t.dim() == 1:
+                        mort_true = mort_t.view(-1, 1, 1).expand_as(mort_out)
+                    elif mort_t.dim() == 2:
+                        if mort_t.shape[1] == 1:
+                            mort_true = mort_t.unsqueeze(-1).expand_as(mort_out)
+                        elif mort_t.shape[1] == T:
+                            mort_true = mort_t.unsqueeze(-1)
+                        else:
+                            mort_true = (
+                                mort_t.view(-1, 1, 1).expand_as(mort_out)
+                            )
+                    elif mort_t.dim() == 3:
+                        if mort_t.shape[1] == 1 and mort_t.shape[2] == 1:
+                            mort_true = mort_t.expand_as(mort_out)
+                        elif mort_t.shape[1] == 1 and mort_t.shape[2] == T:
+                            mort_true = mort_t.transpose(1, 2)
+                        else:
+                            mort_true = mort_t
+                    else:
+                        mort_true = mort_t.view(-1, 1, 1).expand_as(mort_out)
+
                     if mask_tensor is not None:
-                        m_valid = mask_tensor.bool().unsqueeze(-1)
+                        m_valid = mask_tensor.bool()
+                        if m_valid.dim() == 1:
+                            m_valid = m_valid.view(-1, 1, 1).expand_as(mort_out)
+                        elif m_valid.dim() == 2:
+                            if m_valid.shape[1] == T:
+                                m_valid = m_valid.unsqueeze(-1)
+                            else:
+                                m_valid = (
+                                    m_valid.unsqueeze(-1).expand_as(mort_out)
+                                )
+                        elif (
+                            m_valid.dim() == 3
+                            and m_valid.shape[1] == 1
+                            and m_valid.shape[2] == T
+                        ):
+                            m_valid = m_valid.transpose(1, 2)
                         # Apply matching warmup mask (t >= min_time)
                         if T > self.min_time:
                             warmup_m = torch.zeros_like(m_valid)

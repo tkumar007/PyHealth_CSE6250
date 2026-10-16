@@ -97,6 +97,9 @@ def run_ablation_study(
     train_sampler: BucketBatchSampler,
     continuous_dim: int,
     static_dim: int,
+    epochs: int = 2,
+    lr: float = 1e-3,
+    device: str | torch.device = "cpu",
     seed: int = 42,
 ) -> None:
     """Runs the architectural ablation study replicating the paper's methodology.
@@ -109,7 +112,7 @@ def run_ablation_study(
     Experimental Control:
     - Same random seed and batch order across configs.
     - Sampler reset ensures identical mini-batch sequences across all configs.
-    - Fixed 2-epoch training is used here for rapid demonstration.
+    - Configurable training epochs (default 2 for rapid validation).
 
     Args:
         train_loader: DataLoader for training set.
@@ -118,15 +121,19 @@ def run_ablation_study(
         train_sampler: BucketBatchSampler used on train_loader.
         continuous_dim: Number of dynamic time-series features.
         static_dim: Number of static baseline features.
+        epochs: Number of training epochs per ablation config. Default: 2.
+        lr: Learning rate for Adam optimizer. Default: 1e-3.
+        device: Device to train on ('cpu' or 'cuda'). Default: 'cpu'.
         seed: Random seed for initialization. Default: 42.
     """
+    dev = torch.device(device)
     print("\n" + "=" * 85)
     print(
         "HELD-OUT TEST ABLATION STUDY: MULTI-MODAL TPC PIPELINE VERIFICATION (eICU)"
     )
     print(
         f"Features: {continuous_dim} Continuous Time-Series + "
-        f"{static_dim} Static Features"
+        f"{static_dim} Static Features | Device: {dev}"
     )
     print("=" * 85)
 
@@ -138,17 +145,22 @@ def run_ablation_study(
 
     def evaluate_loader(
         model: TPC, loader: DataLoader
-    ) -> tuple[float, float, float, float]:
+    ) -> tuple[float, float, float, float, float]:
         model.eval()
         sum_msle = 0.0
         sum_mse = 0.0
         sum_mae = 0.0
+        sum_mape = 0.0
         sum_mort_bce = 0.0
         total_valid_hours = 0
         total_mort_batches = 0
 
         with torch.no_grad():
-            for batch in loader:
+            for raw_batch in loader:
+                batch = {
+                    k: v.to(dev) if isinstance(v, torch.Tensor) else v
+                    for k, v in raw_batch.items()
+                }
                 out = model(**batch)
                 y_pred = out["y_prob"]
                 y_true = batch["los"]
@@ -166,22 +178,26 @@ def run_ablation_study(
                 # Exclude warmup hours t < 4 (consistent with min_time=4 / 5h)
                 T = yp_2d.shape[1]
                 if T > 4:
-                    m = mask.clone()
-                    m[:, :4] = False
-                    yp = yp_2d[m]
-                    yt = yt_2d[m]
+                    eval_mask = mask.clone()
+                    eval_mask[:, :4] = False
                 else:
-                    yp = yp_2d[mask]
-                    yt = yt_2d[mask]
+                    eval_mask = mask
+                yp = yp_2d[eval_mask]
+                yt = yt_2d[eval_mask]
 
                 n_hrs = yp.numel()
                 if n_hrs > 0:
                     total_valid_hours += n_hrs
+                    yp_clamped = torch.clamp(yp, min=LOS_FLOOR_DAYS)
+                    yt_clamped = torch.clamp(yt, min=LOS_FLOOR_DAYS)
                     sum_msle += torch.sum(
-                        (torch.log(yp) - torch.log(yt)) ** 2
+                        (torch.log(yp_clamped) - torch.log(yt_clamped)) ** 2
                     ).item()
                     sum_mse += torch.sum((yp - yt) ** 2).item()
                     sum_mae += torch.sum(torch.abs(yp - yt)).item()
+                    sum_mape += torch.sum(
+                        torch.abs(yp - yt) / yt_clamped * 100.0
+                    ).item()
 
                 if (
                     model.multitask
@@ -194,7 +210,7 @@ def run_ablation_study(
                         .view(-1, 1, 1)
                         .expand_as(out["mortality_prob"])
                     )
-                    m_eval = (m if T > 4 else mask).unsqueeze(-1)
+                    m_eval = eval_mask.unsqueeze(-1)
                     if m_eval.sum() > 0:
                         mort_loss = torch.nn.functional.binary_cross_entropy(
                             out["mortality_prob"][m_eval],
@@ -202,12 +218,12 @@ def run_ablation_study(
                         ).item()
                         sum_mort_bce += mort_loss
                         total_mort_batches += 1
-
         avg_mort = sum_mort_bce / max(total_mort_batches, 1)
         return (
             sum_msle / max(total_valid_hours, 1),
             sum_mse / max(total_valid_hours, 1),
             sum_mae / max(total_valid_hours, 1),
+            sum_mape / max(total_valid_hours, 1),
             avg_mort,
         )
 
@@ -238,18 +254,23 @@ def run_ablation_study(
             use_decay=cfg["use_decay"],
             multitask=True,
         )
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        model.to(dev)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
         model.train()
-        for _ in range(2):
-            for batch in train_loader:
+        for _ in range(epochs):
+            for raw_batch in train_loader:
+                batch = {
+                    k: v.to(dev) if isinstance(v, torch.Tensor) else v
+                    for k, v in raw_batch.items()
+                }
                 optimizer.zero_grad()
                 out = model(**batch)
                 out["loss"].backward()
                 optimizer.step()
 
-        val_msle, _, _, _ = evaluate_loader(model, val_loader)
-        test_msle, test_mse, test_mae, test_mort = evaluate_loader(
+        val_msle, _, _, _, _ = evaluate_loader(model, val_loader)
+        test_msle, test_mse, test_mae, test_mape, test_mort = evaluate_loader(
             model, test_loader
         )
 
@@ -259,28 +280,31 @@ def run_ablation_study(
                 "Val MSLE": val_msle,
                 "Test MSLE": test_msle,
                 "Test MSE": test_mse,
-                "Test MAE": test_mae,
+                "Test MAD": test_mae,
+                "Test MAPE": test_mape,
                 "Test Mort BCE": test_mort,
             }
         )
 
-    print("\n" + "=" * 98)
+    print("\n" + "=" * 110)
     print(
-        "HELD-OUT TEST ABLATION STUDY RESULTS "
-        "(eICU, 2 epochs – pipeline check only):"
+        f"HELD-OUT TEST ABLATION STUDY RESULTS "
+        f"(eICU, {epochs} epochs – pipeline check only):"
     )
     print(
-        f"{'Configuration':<26} | {'Val MSLE':<10} | {'Test MSLE':<10} | "
-        f"{'Test MSE':<10} | {'Test MAE':<10} | {'Test Mort BCE':<13}"
+        f"{'Configuration':<24} | {'Val MSLE':<9} | {'Test MSLE':<9} | "
+        f"{'Test MSE':<9} | {'Test MAD':<9} | {'Test MAPE':<10} | "
+        f"{'Test Mort BCE':<13}"
     )
-    print("-" * 98)
+    print("-" * 110)
     for r in results:
         print(
-            f"{r['Configuration']:<26} | {r['Val MSLE']:<10.4f} | "
-            f"{r['Test MSLE']:<10.4f} | {r['Test MSE']:<10.4f} | "
-            f"{r['Test MAE']:<10.4f} | {r['Test Mort BCE']:<13.4f}"
+            f"{r['Configuration']:<24} | {r['Val MSLE']:<9.4f} | "
+            f"{r['Test MSLE']:<9.4f} | {r['Test MSE']:<9.4f} | "
+            f"{r['Test MAD']:<9.4f} | {r['Test MAPE']:<9.2f}% | "
+            f"{r['Test Mort BCE']:<13.4f}"
         )
-    print("=" * 98)
+    print("=" * 110)
 
 
 if __name__ == "__main__":
@@ -305,11 +329,45 @@ if __name__ == "__main__":
             "(default: 250000)"
         ),
     )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=2,
+        help="Number of training epochs per ablation config (default: 2)",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=4,
+        help="Batch size for training and evaluation (default: 4)",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate for Adam optimizer (default: 1e-3)",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to run on (default: cuda if available else cpu)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for data split and training (default: 42)",
+    )
     args = parser.parse_args()
 
     eicu_root = args.data_dir
     if not os.path.exists(eicu_root):
-        eicu_root = "https://storage.googleapis.com/pyhealth/eicu-demo/"
+        raise FileNotFoundError(
+            f"eICU data directory not found: '{eicu_root}'. "
+            "Please specify a valid path containing eICU CSV files using "
+            "--data_dir, or ensure './test-resources/core/eicudemo' exists."
+        )
 
     print("1. Initializing eICUDataset...")
     dataset = eICUDataset(
@@ -320,7 +378,7 @@ if __name__ == "__main__":
     # Partition patients strictly BEFORE task processing to prevent any data leakage
     print("\n2. Partitioning patient cohort (70% Train, 15% Val, 15% Test)...")
     all_pids = sorted(dataset.unique_patient_ids)
-    rng = random.Random(42)
+    rng = random.Random(args.seed)
     perm_pids = list(all_pids)
     rng.shuffle(perm_pids)
     n_p = len(perm_pids)
@@ -456,7 +514,10 @@ if __name__ == "__main__":
             sample_dataset[i]["vitals"].shape[0] for i in train_indices
         ]
         train_sampler = BucketBatchSampler(
-            train_lengths, batch_size=4, shuffle=True, seed=42
+            train_lengths,
+            batch_size=args.batch_size,
+            shuffle=True,
+            seed=args.seed,
         )
         train_loader = DataLoader(
             MapDataset(sample_dataset, train_indices),
@@ -465,13 +526,13 @@ if __name__ == "__main__":
         )
         val_loader = DataLoader(
             MapDataset(sample_dataset, val_indices),
-            batch_size=4,
+            batch_size=args.batch_size,
             shuffle=False,
             collate_fn=collate_fn_dict_with_padding,
         )
         test_loader = DataLoader(
             MapDataset(sample_dataset, test_indices),
-            batch_size=4,
+            batch_size=args.batch_size,
             shuffle=False,
             collate_fn=collate_fn_dict_with_padding,
         )
@@ -483,7 +544,10 @@ if __name__ == "__main__":
             train_sampler=train_sampler,
             continuous_dim=task.continuous_dim,
             static_dim=task.static_dim,
-            seed=42,
+            epochs=args.epochs,
+            lr=args.lr,
+            device=args.device,
+            seed=args.seed,
         )
 
         print(

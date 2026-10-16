@@ -32,13 +32,12 @@ Key Features:
 from __future__ import annotations
 
 import hashlib
-import math
 import os
 import pickle
 import tempfile
 from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from pyhealth.datasets import eICUDataset
@@ -178,11 +177,14 @@ def select_qualifying_labs(
                 continue
 
             # Cohort filter: Adult ICU patients (> 18 years at admission)
-            age_str = str(getattr(stay, "age", "63")).replace(">", "").strip()
+            age_raw = getattr(stay, "age", None)
+            if age_raw is None or str(age_raw).strip() == "":
+                continue
+            age_str = str(age_raw).replace(">", "").strip()
             try:
                 age = float(age_str)
             except (ValueError, TypeError):
-                age = 63.0
+                continue
             if age <= 18:
                 continue
 
@@ -263,11 +265,14 @@ def get_valid_eicu_stay_ids(
                 continue
             if offset < min_offset:
                 continue
-            age_str = str(getattr(stay, "age", "63")).replace(">", "").strip()
+            age_raw = getattr(stay, "age", None)
+            if age_raw is None or str(age_raw).strip() == "":
+                continue
+            age_str = str(age_raw).replace(">", "").strip()
             try:
                 age = float(age_str)
             except (ValueError, TypeError):
-                age = 63.0
+                continue
             if age <= min_age:
                 continue
             valid_ids.add(sid)
@@ -332,9 +337,10 @@ def load_eicu_vitals_cache(
         # Chunked ingestion to handle multi-gigabyte tables without memory exhaustion
         for chunk in pd.read_csv(
             pe_path,
-            usecols=lambda c: str(c) in pe_cols_set,
+            usecols=lambda c, s=pe_cols_set: str(c).lower() in s,
             chunksize=chunksize,
         ):
+            chunk.columns = chunk.columns.str.lower()
             chunk = chunk[chunk["physicalexamtext"].notnull()]
             chunk["offset"] = pd.to_numeric(
                 chunk["physicalexamoffset"], errors="coerce"
@@ -357,6 +363,8 @@ def load_eicu_vitals_cache(
                     if sub in path:
                         try:
                             val = float(text)
+                            if vkey == "temperature" and val > 50.0:
+                                val = (val - 32.0) * 5.0 / 9.0
                             if sid not in vitals_raw:
                                 vitals_raw[sid] = []
                             vitals_raw[sid].append((off, hour, vkey, val))
@@ -390,26 +398,41 @@ def load_eicu_vitals_cache(
                             pass
                         break
 
-    # 2. Check for optional vitalPeriodic.csv / vitalPeriodic.csv.gz
-    vp_csv = os.path.join(eicu_root, "vitalPeriodic.csv")
-    vp_gz = os.path.join(eicu_root, "vitalPeriodic.csv.gz")
-    vp_path = vp_csv if os.path.exists(vp_csv) else (
-        vp_gz if os.path.exists(vp_gz) else None
-    )
-
-    if vp_path is not None:
-        try:
-            col_map = {
+    # 2. Check for optional vitalPeriodic and vitalAperiodic tables
+    tables_config = [
+        (
+            "vitalPeriodic",
+            {
                 "heartrate": "heart_rate",
                 "systemicsystolic": "systolic_bp",
                 "systemicdiastolic": "diastolic_bp",
                 "respiration": "respiration_rate",
                 "sao2": "spo2",
                 "temperature": "temperature",
-            }
-            # Inspect column headers without reading rows
+            },
+        ),
+        (
+            "vitalAperiodic",
+            {
+                "noninvasivesystolic": "systolic_bp",
+                "noninvasivediastolic": "diastolic_bp",
+                "temperature": "temperature",
+            },
+        ),
+    ]
+
+    for table_base, col_map in tables_config:
+        tbl_csv = os.path.join(eicu_root, f"{table_base}.csv")
+        tbl_gz = os.path.join(eicu_root, f"{table_base}.csv.gz")
+        tbl_path = tbl_csv if os.path.exists(tbl_csv) else (
+            tbl_gz if os.path.exists(tbl_gz) else None
+        )
+        if tbl_path is None:
+            continue
+
+        try:
             header_cols = [
-                c.lower() for c in pd.read_csv(vp_path, nrows=0).columns
+                c.lower() for c in pd.read_csv(tbl_path, nrows=0).columns
             ]
             available_cols = [
                 c
@@ -423,8 +446,8 @@ def load_eicu_vitals_cache(
             ):
                 available_set = set(available_cols)
                 for chunk in pd.read_csv(
-                    vp_path,
-                    usecols=lambda c: str(c) in available_set,
+                    tbl_path,
+                    usecols=lambda c, s=available_set: str(c).lower() in s,
                     chunksize=chunksize,
                 ):
                     chunk.columns = chunk.columns.str.lower()
@@ -452,8 +475,14 @@ def load_eicu_vitals_cache(
                                 c_val = getattr(row, c_name)
                                 if pd.notnull(c_val):
                                     try:
+                                        val = float(c_val)
+                                        if (
+                                            vkey == "temperature"
+                                            and val > 50.0
+                                        ):
+                                            val = (val - 32.0) * 5.0 / 9.0
                                         vitals_raw[sid].append(
-                                            (off, hour, vkey, float(c_val))
+                                            (off, hour, vkey, val)
                                         )
                                     except (ValueError, TypeError):
                                         pass
@@ -478,21 +507,6 @@ def load_eicu_vitals_cache(
             pickle.dump((vitals_by_stay, baseline_static_by_stay), f)
 
     return vitals_by_stay, baseline_static_by_stay
-
-
-def _percentile(data: list[float], q: float) -> float:
-    """Computes the q-th percentile (0-100) using linear interpolation."""
-    s = sorted(data)
-    n = len(s)
-    if n == 1:
-        return s[0]
-    idx = (q / 100.0) * (n - 1)
-    low = math.floor(idx)
-    high = math.ceil(idx)
-    if low == high:
-        return s[low]
-    weight = idx - low
-    return s[low] * (1.0 - weight) + s[high] * weight
 
 
 def compute_empirical_training_stats(
@@ -559,7 +573,7 @@ def compute_empirical_training_stats(
         "ethnicity": set(),
     }
 
-    train_stay_ids: set[str] = set()
+    train_stay_max_hours: dict[str, int] = {}
 
     for patient in dataset.iter_patients():
         if str(patient.patient_id) not in train_pids:
@@ -580,17 +594,20 @@ def compute_empirical_training_stats(
             if discharge_offset < 300.0:
                 continue
 
-            age_str = str(getattr(stay, "age", "63")).replace(">", "").strip()
+            age_raw = getattr(stay, "age", None)
+            if age_raw is None or str(age_raw).strip() == "":
+                continue
+            age_str = str(age_raw).replace(">", "").strip()
             try:
                 age = float(age_str)
             except (ValueError, TypeError):
-                age = 63.0
+                continue
             if age <= 18:
                 continue
 
             sid = str(getattr(stay, "patientunitstayid", ""))
-            train_stay_ids.add(sid)
             stay_end = min(discharge_offset, 20160.0)
+            train_stay_max_hours[sid] = int(stay_end // 60)
 
             # Continuous static: age
             continuous_static_vals["age"].append(age)
@@ -652,31 +669,35 @@ def compute_empirical_training_stats(
                         except (ValueError, TypeError):
                             pass
 
-    # Collect vitals values from training stays
+    # Collect vitals values strictly within stay window from training stays
     if vitals_by_stay:
-        for sid in train_stay_ids:
+        for sid, max_h in train_stay_max_hours.items():
             for hour, vkey, val in vitals_by_stay.get(sid, []):
-                if vkey in ts_vals:
+                if 0 <= hour < max_h and vkey in ts_vals:
                     ts_vals[vkey].append(val)
 
     # 1. Empirical time-series normalization stats (mean, std)
     ts_stats: dict[str, tuple[float, float]] = {}
     ts_counts: dict[str, int] = {}
-    all_keys = list(lab_names) + (
+    all_keys = (
         [k for k in CORE_VITALS_MAP] if vitals_by_stay else []
-    )
+    ) + list(lab_names)
 
     for item_id in all_keys:
         vals = ts_vals.get(item_id, [])
         ts_counts[item_id] = len(vals)
         if len(vals) > 0:
-            arr = np.asarray(vals, dtype=np.float64)
-            p1 = float(np.percentile(arr, 1.0))
-            p99 = float(np.percentile(arr, 99.0))
-            clipped = np.clip(arr, p1, p99)
-            mean = float(np.mean(clipped))
-            std = float(np.std(clipped))
-            ts_stats[item_id] = (mean, std if std > 1e-4 else 1.0)
+            arr: Any = np.asarray(vals, dtype=np.float64)
+            arr = arr[np.isfinite(arr)]
+            if len(arr) > 0:
+                p1 = float(np.percentile(arr, 1.0))
+                p99 = float(np.percentile(arr, 99.0))
+                clipped: Any = np.clip(arr, p1, p99)
+                mean = float(np.mean(clipped))
+                std = float(np.std(clipped))
+                ts_stats[item_id] = (mean, std if std > 1e-4 else 1.0)
+            else:
+                ts_stats[item_id] = (0.0, 1.0)
         else:
             ts_stats[item_id] = (0.0, 1.0)
 
@@ -693,11 +714,17 @@ def compute_empirical_training_stats(
     for k, prior in default_priors.items():
         vals = continuous_static_vals.get(k, [])
         if len(vals) > 0:
-            arr = np.asarray(vals, dtype=np.float64)
-            mean = float(np.mean(arr))
-            std = float(np.std(arr))
-            median = float(np.median(arr))
-            static_stats[k] = (mean, std if std > 1e-4 else prior[1], median)
+            arr_s: Any = np.asarray(vals, dtype=np.float64)
+            arr_s = arr_s[np.isfinite(arr_s)]
+            if len(arr_s) > 0:
+                mean = float(np.mean(arr_s))
+                std = float(np.std(arr_s))
+                median = float(np.median(arr_s))
+                static_stats[k] = (
+                    mean, std if std > 1e-4 else prior[1], median
+                )
+            else:
+                static_stats[k] = prior
         else:
             static_stats[k] = prior
 
@@ -911,8 +938,9 @@ class LengthOfStayTPCeICU(BaseTask):
                 loaded = pickle.load(f)
                 if isinstance(loaded, tuple) and len(loaded) == 2:
                     loaded = loaded[0]
-                _VITALS_MEM_CACHE[self.vitals_hash] = loaded
-                return loaded
+                v_dict = cast(dict[str, list[tuple[int, str, float]]], loaded)
+                _VITALS_MEM_CACHE[self.vitals_hash] = v_dict
+                return v_dict
         return {}
 
     @property
@@ -925,8 +953,9 @@ class LengthOfStayTPCeICU(BaseTask):
                 loaded = pickle.load(f)
                 if isinstance(loaded, tuple) and len(loaded) == 2:
                     loaded = loaded[1]
-                _BASELINE_MEM_CACHE[self.baseline_hash] = loaded
-                return loaded
+                b_dict = cast(dict[str, dict[str, float]], loaded)
+                _BASELINE_MEM_CACHE[self.baseline_hash] = b_dict
+                return b_dict
         return {}
 
     def __getstate__(self) -> dict[str, Any]:
@@ -960,7 +989,8 @@ class LengthOfStayTPCeICU(BaseTask):
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         """Restores state upon unpickling."""
-        self.__dict__.update(state)
+        for k, v in state.items():
+            setattr(self, k, v)
 
     @staticmethod
     def _one_hot(val: str, vocab: list[str]) -> list[float]:
@@ -1026,11 +1056,14 @@ class LengthOfStayTPCeICU(BaseTask):
                 continue
 
             # Cohort filter: Adult ICU patients (> 18 years at admission)
-            age_str = str(getattr(stay, "age", "63")).replace(">", "").strip()
+            age_raw = getattr(stay, "age", None)
+            if age_raw is None or str(age_raw).strip() == "":
+                continue
+            age_str = str(age_raw).replace(">", "").strip()
             try:
                 age = float(age_str)
             except (ValueError, TypeError):
-                age = 63.0
+                continue
             if age <= 18:
                 continue
 
@@ -1230,6 +1263,21 @@ class LengthOfStayTPCeICU(BaseTask):
 LengthOfStayPredictionTPCeICU = LengthOfStayTPCeICU
 
 
+def length_of_stay_tpc_eicu_fn(patient: Any) -> list[dict[str, Any]]:
+    """Functional task wrapper for eICU length of stay prediction with TPC.
+
+    Constructs a default LengthOfStayTPCeICU task instance and processes
+    the patient record.
+
+    Args:
+        patient: Patient record from eICUDataset.
+
+    Returns:
+        list[dict[str, Any]]: List of processed samples.
+    """
+    return LengthOfStayTPCeICU()(patient)
+
+
 class MapDataset(torch.utils.data.Dataset):
     """Map-style dataset enabling custom BatchSampler and length bucketing.
 
@@ -1317,6 +1365,10 @@ class BucketBatchSampler(Sampler[list[int]]):
             shuffle: Whether to shuffle batches each epoch. Default: True.
             seed: Random seed for deterministic batch permutation. Default: 42.
         """
+        if batch_size <= 0:
+            raise ValueError(
+                f"batch_size must be positive, got {batch_size}"
+            )
         self.lengths = lengths
         self.batch_size = batch_size
         self.shuffle = shuffle
@@ -1343,4 +1395,6 @@ class BucketBatchSampler(Sampler[list[int]]):
 
     def __len__(self) -> int:
         """Returns total number of mini-batches."""
+        if not self.lengths:
+            return 0
         return (len(self.lengths) + self.batch_size - 1) // self.batch_size

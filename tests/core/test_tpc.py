@@ -9,12 +9,14 @@ Description: Unit tests for TPC model architecture, forward-filling & decay indi
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 # Ensure repository root is on sys.path regardless of execution directory
@@ -22,13 +24,14 @@ repo_root = str(Path(__file__).resolve().parents[2])
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
-from pyhealth.datasets import collate_fn_dict_with_padding
+from pyhealth.datasets import collate_fn_dict_with_padding, eICUDataset
 from pyhealth.models.tpc import TPC
 from pyhealth.tasks import LengthOfStayTPCeICU
 from pyhealth.tasks.length_of_stay_tpc_eicu import (
     DEFAULT_LAB_NAMES,
     BucketBatchSampler,
     MapDataset,
+    compute_empirical_training_stats,
     generate_tpc_tensors,
     get_valid_eicu_stay_ids,
     load_eicu_vitals_cache,
@@ -135,7 +138,7 @@ class TestTPCModel(unittest.TestCase):
             (2, 24, 12, 2),
             (4, 48, 12, 2),
         ]:
-            mock_dataset = MockDataset()
+            mock_dataset: Any = MockDataset()
             vitals = torch.randn(batch_size, seq_len, num_vitals)
             vitals_time_delta = (
                 torch.rand(batch_size, seq_len, num_vitals) * 5.0
@@ -170,6 +173,17 @@ class TestTPCModel(unittest.TestCase):
             )
             self.assertFalse(torch.isnan(output["loss"]))
             self.assertTrue((output["y_prob"] > 0).all())
+
+            # Test transposed labels (B, 1, T)
+            transposed_labels = mock_labels.transpose(1, 2)
+            out_trans = model(
+                vitals=vitals,
+                static=static,
+                y_true=transposed_labels,
+                mask=mask,
+            )
+            self.assertIn("loss", out_trans)
+            self.assertFalse(torch.isnan(out_trans["loss"]))
 
     def test_tpc_causality(self):
         """Verifies strict causal convolution without future lookahead."""
@@ -324,6 +338,49 @@ class TestTPCModel(unittest.TestCase):
         out["loss"].backward()
         optimizer.step()
 
+    def test_tpc_full_gradient_flow(self):
+        """Verifies that gradients flow to all model parameters without NaN."""
+        batch_size = 2
+        seq_len = 16
+        num_vitals = 6
+        static_dim = 4
+
+        model = TPC(
+            dataset=None,
+            continuous_dim=num_vitals,
+            static_dim=static_dim,
+            n_layers=2,
+            multitask=True,
+        )
+        model.train()
+
+        vitals = torch.randn(batch_size, seq_len, num_vitals)
+        vitals_decay = torch.rand(batch_size, seq_len, num_vitals)
+        static = torch.randn(batch_size, static_dim)
+        y_true = torch.rand(batch_size, seq_len, 1) + 0.1
+        mortality = torch.randint(0, 2, (batch_size, 1)).float()
+
+        out = model(
+            vitals=vitals,
+            vitals_decay=vitals_decay,
+            static=static,
+            y_true=y_true,
+            mortality=mortality,
+        )
+        self.assertIn("loss", out)
+        out["loss"].backward()
+
+        for name, param in model.named_parameters():
+            if name != "_dummy_param" and param.requires_grad:
+                self.assertIsNotNone(
+                    param.grad, f"Parameter '{name}' received no gradient."
+                )
+                assert param.grad is not None
+                self.assertFalse(
+                    torch.isnan(param.grad).any(),
+                    f"Parameter '{name}' received NaN gradient.",
+                )
+
     def test_tpc_multitask(self):
         """Tests multitask learning with both LoS and in-hospital mortality."""
         batch_size = 2
@@ -357,6 +414,29 @@ class TestTPCModel(unittest.TestCase):
                 & (output["mortality_prob"] <= 1.0)
             ).all()
         )
+
+        # Test with 3D mask (B, T, 1)
+        mask_3d = torch.ones(batch_size, seq_len, 1, dtype=torch.bool)
+        output_3d = model(
+            vitals=vitals,
+            y_true=y_true,
+            mortality=mortality,
+            mask=mask_3d,
+        )
+        self.assertIn("loss", output_3d)
+        self.assertFalse(torch.isnan(output_3d["loss"]))
+
+        # Test with sequence mortality (B, T) and scalar y_true (B,)
+        mort_seq = torch.randint(0, 2, (batch_size, seq_len)).float()
+        y_scalar = torch.tensor([2.5, 3.5])
+        out_seq = model(
+            vitals=vitals,
+            y_true=y_scalar,
+            mortality=mort_seq,
+        )
+        self.assertIn("loss", out_seq)
+        self.assertFalse(torch.isnan(out_seq["loss"]))
+        self.assertEqual(out_seq["y_prob"].shape, (batch_size, seq_len, 1))
 
     def test_tpc_no_decay_ablation(self):
         """Tests TPC ablation variant without decay channels (use_decay=False)."""
@@ -403,7 +483,7 @@ class TestTPCModel(unittest.TestCase):
 
     def test_tpc_dataset_dimension_inference(self):
         """Verifies input dimensions are inferred from dataset and logit is returned."""
-        ds = MockDataset()
+        ds: Any = MockDataset()
         model = TPC(dataset=ds)
         self.assertEqual(model.continuous_dim, 16)
         self.assertEqual(model.static_dim, 44)
@@ -412,6 +492,14 @@ class TestTPCModel(unittest.TestCase):
         self.assertIn("y_prob", out)
         self.assertIn("logit", out)
         self.assertEqual(out["logit"].shape, (2, 24, 1))
+
+    def test_tpc_static_1d_broadcast(self):
+        """Verifies 1D static tensor is safely broadcast across mini-batch."""
+        model = TPC(dataset=None, continuous_dim=12, static_dim=5)
+        vitals = torch.randn(3, 20, 12)
+        static_1d = torch.randn(5)
+        out = model(vitals=vitals, static=static_1d)
+        self.assertEqual(out["y_prob"].shape, (3, 20, 1))
 
     def test_tpc_input_validation_raises_type_error(self):
         """Verifies that non-Tensor vitals input raises TypeError."""
@@ -450,6 +538,15 @@ class TestTPCTask(unittest.TestCase):
         # Stay with no observations should be skipped
         p_nolab = MockPatient(age=50, stay_hours=10, has_lab=False)
         self.assertEqual(len(task(p_nolab)), 0)
+
+        # Missing or empty age string should be skipped
+        p_empty_age = MockPatient(age=50, stay_hours=10, has_lab=True)
+        p_empty_age.events["patient"][0].age = ""
+        self.assertEqual(len(task(p_empty_age)), 0)
+
+        p_null_age = MockPatient(age=50, stay_hours=10, has_lab=True)
+        p_null_age.events["patient"][0].age = None
+        self.assertEqual(len(task(p_null_age)), 0)
 
     def test_static_features_deterministic_and_one_hot(self):
         """Tests that static feature extraction is deterministic and valid one-hot."""
@@ -613,6 +710,69 @@ class TestTPCTask(unittest.TestCase):
         self.assertFalse(threshold_met)
         self.assertEqual(selected, DEFAULT_LAB_NAMES)
 
+    def test_compute_empirical_training_stats_non_finite_resilience(self):
+        """Tests that compute_empirical_training_stats handles non-finite values."""
+        p = MockPatient(
+            patient_id="p_finite", age=45.0, stay_hours=24, has_lab=False
+        )
+        # Add lab events with valid, NaN, and Inf values
+        p.events["lab"] = [
+            type("Event", (), {
+                "patientunitstayid": "s0",
+                "labresultoffset": 120.0,
+                "labname": "glucose",
+                "labresult": 100.0,
+            })(),
+            type("Event", (), {
+                "patientunitstayid": "s0",
+                "labresultoffset": 180.0,
+                "labname": "glucose",
+                "labresult": float("nan"),
+            })(),
+            type("Event", (), {
+                "patientunitstayid": "s0",
+                "labresultoffset": 240.0,
+                "labname": "glucose",
+                "labresult": float("inf"),
+            })(),
+            type("Event", (), {
+                "patientunitstayid": "s0",
+                "labresultoffset": 300.0,
+                "labname": "glucose",
+                "labresult": 110.0,
+            })(),
+        ]
+        mock_ds: Any = type(
+            "MockDS", (), {"iter_patients": lambda self: [p]}
+        )()
+
+        vitals = {
+            "s0": [
+                (1, "heart_rate", 80.0),
+                (2, "heart_rate", float("nan")),
+                (3, "heart_rate", float("inf")),
+                (4, "heart_rate", 90.0),
+            ]
+        }
+
+        ts_stats, _, static_stats, _ = compute_empirical_training_stats(
+            mock_ds,
+            train_pids={"p_finite"},
+            lab_names=["glucose"],
+            vitals_by_stay=vitals,
+        )
+
+        for k, (mean, std) in ts_stats.items():
+            self.assertFalse(np.isnan(mean), f"NaN mean in {k}")
+            self.assertFalse(np.isinf(mean), f"Inf mean in {k}")
+            self.assertFalse(np.isnan(std), f"NaN std in {k}")
+            self.assertFalse(np.isinf(std), f"Inf std in {k}")
+
+        for k, (mean, std, med) in static_stats.items():
+            self.assertFalse(np.isnan(mean), f"NaN static mean in {k}")
+            self.assertFalse(np.isnan(std), f"NaN static std in {k}")
+            self.assertFalse(np.isnan(med), f"NaN static med in {k}")
+
     def test_bucket_batch_sampler(self):
         """Tests BucketBatchSampler indexing, shuffling, and reset replay."""
         lengths = [12, 14, 15, 20, 22, 25, 48, 50, 52, 100, 105, 110]
@@ -639,6 +799,13 @@ class TestTPCTask(unittest.TestCase):
         sampler.reset()
         batches_ep0_replay = list(sampler)
         self.assertEqual(batches_ep0_replay, batches_ep0)
+
+        # 4. Error handling and empty sequence checks
+        with self.assertRaises(ValueError):
+            BucketBatchSampler([10, 20], batch_size=0)
+        empty_sampler = BucketBatchSampler([], batch_size=4)
+        self.assertEqual(len(empty_sampler), 0)
+        self.assertEqual(list(empty_sampler), [])
 
     def test_map_dataset_lazy_indexing(self):
         """Tests that MapDataset supports both eager lists and lazy index mapping."""
@@ -689,6 +856,47 @@ class TestTPCTask(unittest.TestCase):
             self.assertEqual(vitals["stay_1"][0], (1, "heart_rate", 80.0))
             self.assertEqual(vitals["stay_1"][1], (3, "heart_rate", 85.0))
 
+    def test_load_eicu_vitals_cache_periodic_and_aperiodic_tables(self):
+        """Tests that periodic and aperiodic tables are parsed and merged."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            p_content = (
+                "PatientUnitStayID,ObservationOffset,heartRate,"
+                "systemicSystolic,temperature\n"
+                "stay_1,30,72,120,36.8\n"
+                "stay_2,60,80,110,37.0\n"
+            )
+            (tmp_path / "vitalPeriodic.csv").write_text(p_content)
+
+            ap_content = (
+                "patientunitstayid,observationoffset,noninvasivesystolic,"
+                "temperature\n"
+                "stay_1,90,125,98.6\n"
+                "stay_1,15,118,97.7\n"
+            )
+            (tmp_path / "vitalAperiodic.csv").write_text(ap_content)
+
+            vitals, _ = load_eicu_vitals_cache(
+                str(tmp_path), chunksize=1, valid_stay_ids={"stay_1"}
+            )
+            self.assertIn("stay_1", vitals)
+            self.assertNotIn("stay_2", vitals)
+
+            records = vitals["stay_1"]
+            # All stay_1 records: offset 15, offset 30, offset 90
+            self.assertTrue(len(records) >= 4)
+            # Chronological check: hour of offset 15 is 0, hour of offset 90 is 1
+            self.assertEqual(records[0][0], 0)
+            self.assertEqual(records[-1][0], 1)
+
+            # Check that 98.6 deg F was converted to approx 37.0 deg C
+            temp_records = [r for r in records if r[1] == "temperature"]
+            self.assertTrue(len(temp_records) >= 2)
+            converted_temps = [r[2] for r in temp_records]
+            # Should have ~36.5 (from 97.7 F), 36.8 (C), and ~37.0 (from 98.6 F)
+            self.assertTrue(any(abs(t - 37.0) < 0.1 for t in converted_temps))
+            self.assertTrue(any(abs(t - 36.5) < 0.1 for t in converted_temps))
+
     def test_get_valid_eicu_stay_ids(self):
         """Tests get_valid_eicu_stay_ids filtering on adult and >=5h criteria."""
         class MockPatientObj:
@@ -708,6 +916,15 @@ class TestTPCTask(unittest.TestCase):
         mock_ds = type("DS", (), {"iter_patients": lambda self: [p_adult]})()
         valid_ids = get_valid_eicu_stay_ids(mock_ds)
         self.assertEqual(valid_ids, {"stay_valid"})
+
+    def test_length_of_stay_tpc_eicu_fn(self):
+        """Tests length_of_stay_tpc_eicu_fn functional task wrapper."""
+        from pyhealth.tasks import length_of_stay_tpc_eicu_fn
+        p_empty = type(
+            "P", (), {"get_events": lambda self, event_type: []}
+        )()
+        samples = length_of_stay_tpc_eicu_fn(p_empty)
+        self.assertEqual(samples, [])
 
     def test_task_cache_fingerprint_decoupled(self):
         """Tests that task keeps large dicts out of vars(task) for json.dumps."""
@@ -730,6 +947,102 @@ class TestTPCTask(unittest.TestCase):
         # 3. Transparent property access returns the full dictionary
         self.assertEqual(len(task.vitals_by_stay), 50)
         self.assertIn("stay_0", task.vitals_by_stay)
+
+
+class TestEICUDemoTPCIntegration(unittest.TestCase):
+    """Integration tests for TPC task and model pipeline using local eICU demo data."""
+
+    def setUp(self):
+        """Set up demo dataset path for integration tests."""
+        test_dir = Path(__file__).resolve().parents[2]
+        self.demo_dataset_path = str(
+            test_dir / "test-resources" / "core" / "eicudemo"
+        )
+
+    def test_eicu_demo_dataset_stats(self):
+        """Tests eICUDataset instantiation and stats() on demo data."""
+        if not os.path.exists(self.demo_dataset_path):
+            self.skipTest(f"Demo data not found at {self.demo_dataset_path}")
+
+        dataset = eICUDataset(
+            root=self.demo_dataset_path, tables=["patient", "lab"]
+        )
+        dataset.stats()
+        self.assertGreater(len(dataset.unique_patient_ids), 0)
+
+    def test_eicu_demo_tpc_task_and_model_pipeline(self):
+        """Tests LengthOfStayTPCeICU set_task and TPC model forward on demo data."""
+        if not os.path.exists(self.demo_dataset_path):
+            self.skipTest(f"Demo data not found at {self.demo_dataset_path}")
+
+        dataset = eICUDataset(
+            root=self.demo_dataset_path, tables=["patient", "lab"]
+        )
+        valid_ids = get_valid_eicu_stay_ids(dataset)
+        self.assertGreater(len(valid_ids), 0)
+
+        vitals, base = load_eicu_vitals_cache(
+            self.demo_dataset_path, valid_stay_ids=valid_ids
+        )
+        self.assertGreater(len(vitals), 0)
+        self.assertGreater(len(base), 0)
+
+        task = LengthOfStayTPCeICU(
+            vitals_by_stay=vitals,
+            baseline_static_by_stay=base,
+        )
+
+        self.assertEqual(
+            task.task_name, "eICU Remaining Length of Stay Prediction (TPC)"
+        )
+        for k in ["vitals", "vitals_decay", "static", "mask"]:
+            self.assertIn(k, task.input_schema)
+        for k in ["los", "mortality"]:
+            self.assertIn(k, task.output_schema)
+
+        sample_dataset = dataset.set_task(task)
+        self.assertIsNotNone(sample_dataset)
+        self.assertGreater(len(sample_dataset), 0)
+
+        sample0 = sample_dataset[0]
+        required_keys = [
+            "visit_id",
+            "patient_id",
+            "vitals",
+            "vitals_decay",
+            "static",
+            "mask",
+            "los",
+            "mortality",
+        ]
+        for key in required_keys:
+            self.assertIn(key, sample0)
+
+        self.assertEqual(sample0["vitals"].shape[-1], task.continuous_dim)
+        self.assertEqual(sample0["vitals_decay"].shape, sample0["vitals"].shape)
+        self.assertEqual(sample0["static"].shape[0], task.static_dim)
+        self.assertEqual(sample0["mask"].shape[0], sample0["vitals"].shape[0])
+        self.assertEqual(sample0["los"].shape[0], sample0["vitals"].shape[0])
+        self.assertEqual(sample0["los"].shape[1], 1)
+        self.assertTrue((sample0["los"] >= 1.0 / 48.0).all())
+
+        # Test TPC model instantiation from real SampleDataset
+        model = TPC(dataset=sample_dataset, multitask=True)
+        self.assertEqual(model.continuous_dim, task.continuous_dim)
+        self.assertEqual(model.static_dim, task.static_dim)
+
+        # Test batch forward propagation and loss computation
+        batch = collate_fn_dict_with_padding(
+            [sample_dataset[0], sample_dataset[1]]
+        )
+        out = model(**batch)
+        self.assertIn("loss", out)
+        self.assertIn("y_prob", out)
+        self.assertIn("logit", out)
+        self.assertIn("mortality_prob", out)
+        self.assertIn("mortality_logit", out)
+        self.assertFalse(torch.isnan(out["loss"]))
+        self.assertTrue((out["y_prob"] > 0).all())
 
 
 if __name__ == "__main__":
