@@ -429,6 +429,7 @@ Model                                 Year    Key Innovation
 **StageNet**                          2020    Disease progression stage modeling
 **GRASP**                             2021    Graph neural networks for patient clustering
 **MICRON**                            2021    Medication change prediction with recurrent residual networks
+**TPC**                               2021    Temporal Pointwise Convolutions for remaining length of stay & mortality in ICU
 ==================================    ======  ============================================================================================================
 
 **Foundation Models**
