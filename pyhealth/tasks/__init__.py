@@ -58,6 +58,11 @@ from .length_of_stay_tpc_eicu import (
     load_eicu_vitals_cache as load_eicu_vitals_cache,
     select_qualifying_labs as select_qualifying_labs,
 )
+from .length_of_stay_tpc_mimic4 import (
+    ChartEventSQLite as ChartEventSQLite,
+    LengthOfStayTPCMIMIC4 as LengthOfStayTPCMIMIC4,
+    build_chart_event_cache as build_chart_event_cache,
+)
 from .medical_coding import MIMIC3ICD9Coding
 from .medical_transcriptions_classification import MedicalTranscriptionsClassification
 from .mortality_prediction import (
